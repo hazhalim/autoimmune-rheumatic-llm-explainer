@@ -2,11 +2,11 @@ scikit-learn==1.6.1
 shap==0.50.0
 numba==0.60.0
 numpy==2.0.2
-kaleido==0.4.2
+kaleido==0.2.1
 streamlit
 joblib
 pandas
-plotly
+plotly<5.18
 matplotlib
 protobuf
 google-genai
