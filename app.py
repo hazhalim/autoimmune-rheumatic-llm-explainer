@@ -24,7 +24,15 @@ from google.genai.types import GenerateContentConfig
 from io import BytesIO
 import os
 import kaleido
+import plotly.io as pio
 
+# Fix with Streamlit
+pio.kaleido.scope.chromium_args = (
+        "--headless",
+        "--no-sandbox",
+        "--single-process",
+        "--disable-gpu"
+)
 # Unused imports
 # from sdv.utils import load_synthesizer
 # import torch
