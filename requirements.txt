@@ -11,3 +11,4 @@ protobuf
 google-genai
 pillow
 kaleido
+catboost
