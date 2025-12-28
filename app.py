@@ -1,0 +1,1054 @@
+# Installs
+# pip install streamlit joblib sdv pandas numpy torch
+
+# Imports
+# Base disease diagnosis imports
+import streamlit as st
+import joblib
+import pandas as pd
+import numpy as np
+import traceback
+import sys
+
+# SHAP and LIME imports
+import plotly
+import plotly.express as px
+import matplotlib.pyplot as plt
+import shap
+import streamlit.components.v1 as components
+
+# Gemini imports
+from google import genai
+from PIL import Image
+from google.genai.types import GenerateContentConfig
+from io import BytesIO
+import os
+import kaleido
+
+# Unused imports
+# from sdv.utils import load_synthesizer
+# import torch
+# from sdv.sampling import Condition
+
+# Constants
+AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES = [
+    'Ankylosing Spondylitis',      # 0
+    'Normal',                      # 1
+    'Psoriatic Arthritis',         # 2
+    'Reactive Arthritis',          # 3
+    'Rheumatoid Arthritis',        # 4
+    "Sjögren's Syndrome",          # 5
+    'Systemic Lupus Erythematosus' # 6
+]
+
+AUTOIMMUNE_RHEUMATIC_DISEASE_MAPPING = {
+    0: 'Ankylosing Spondylitis',
+    1: 'Normal',
+    2: 'Psoriatic Arthritis',
+    3: 'Reactive Arthritis',
+    4: 'Rheumatoid Arthritis',
+    5: "Sjögren's Syndrome",
+    6: 'Systemic Lupus Erythematosus'
+}
+
+FINAL_FEATURE_NAMES = [
+        'age', 'ESR', 'CRP', 'RF', 'antiCCP', 'C3', 'C4',
+        'CRP_ESR_ratio', 'RF_antiCCP_ratio', 'C3_C4_ratio',
+        'ena_count', 'systemic_autoantibody_count',
+        'rf_antibody_score', 'spondyloarthropathy_risk',
+        'gender', 'HLA_B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA', 'antiSm', 'inflammation_status'
+]
+
+# Functions
+# Loading files/models function
+@st.cache_resource
+def load_resources():
+    p1 = joblib.load('preprocessor_1.joblib')
+    p2 = joblib.load('preprocessor_2.joblib')
+    knn = joblib.load('knn_imputer.joblib')
+
+    # Not using this anymore
+    # synthesizer = load_synthesizer('autoimmune_rheumatic_diagnosis_synthesizer_27-12-2025-18-18.pkl')
+
+    cbc = joblib.load('cbc_model.joblib')
+
+    # Initialise the SHAP TreeExplainer
+    explainer = shap.TreeExplainer(cbc)
+
+    X_sample = shap.sample(joblib.load('X_train_scaled_final.joblib'), 1000)
+
+    # Calculate global SHAP values
+    global_shap_values = explainer.shap_values(X_sample)
+
+    global_shap_explanation = explainer(X_sample)
+
+    GEMINI_API_KEY = st.secrets["gemini_api_key"]
+
+    gemini = genai.Client(api_key=GEMINI_API_KEY)
+
+    return p1, p2, knn, cbc, explainer, X_sample, global_shap_values, global_shap_explanation, GEMINI_API_KEY, gemini
+
+# Immediately load the models
+preprocessor_1, preprocessor_2, knn_imputer, model, explainer, X_sample, global_shap_values, global_shap_explanation, GEMINI_API_KEY, gemini = load_resources()
+
+# Transforming input data function
+def transform_data(raw_input_data):
+  """
+  Returns final scaled row and final row for LIME purposes.
+  """
+  # Convert raw data from dictionary form to DataFrame form
+  loaded_row = pd.DataFrame([raw_input_data])
+  imputed_row = pd.DataFrame()
+
+  # FEATURE SCALING
+  # Features to scale (non-binary)
+  continuous_features = ['age', 'ESR', 'CRP', 'RF', 'antiCCP', 'C3', 'C4']
+
+  # Get binary features
+  binary_features = loaded_row.columns.drop(continuous_features).tolist()
+
+  # Transform the data
+  scaled_row_array = preprocessor_1.transform(loaded_row)
+
+  new_column_order = continuous_features + binary_features
+
+  scaled_row = pd.DataFrame(scaled_row_array, columns=new_column_order)
+
+  # IMPUTING MISSING VALUES
+  # Check for any missing values, if there is, impute by CTGANSynthesizer with conditions if GPU is enabled, else use KNNImputer
+  imputed_row = scaled_row.copy()
+
+  # torch.cuda_is_available() in place of False if GPU is available
+  if scaled_row.isna().values.any() and False:
+    row = scaled_row.copy()
+
+    # Drop the columns where values are missing
+    known_features = row.dropna()
+
+    # Export the values
+    known_features_dict = known_features.to_dict()
+
+    # Create the sampling condition
+    # imputation_condition = Condition(
+    #     num_rows=1,
+    #     column_values=known_features_dict
+    # )
+
+    # Create the imputed rows
+    # Uncomment line below when using GPU
+    # imputed_row = synthesizer.sample_from_conditions([imputation_condition])
+
+  elif scaled_row.isna().values.any():
+    # If GPU is not available, we impute using KNNImputer
+    # Define the binary (False/True, 0/1) columns
+    binary_columns = ['HLA_B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA', 'antiSm']
+
+    # Transform the row using KNNImputer
+    imputed_row_array = knn_imputer.transform(scaled_row)
+
+    # Convert the imputed features back and its column names to a DataFrame (because imputer returns a NumPy array, not a DataFrame)
+    imputed_row = pd.DataFrame(imputed_row_array, columns=scaled_row.columns)
+
+    # Round the values of the binary columns
+    for column in binary_columns:
+        imputed_row[column] = np.round(imputed_row[column])
+        imputed_row[column] = imputed_row[column].astype(int)
+
+  # FEATURE ENGINEERING
+  # Get back the StandardScaler of the first feature scaling
+  initial_scaler = preprocessor_1.named_transformers_['cont_scaler']
+
+  # Get the indices for ESR and CRP
+  ESR_index = 1
+  CRP_index = 2
+
+  # Get ESR and CRP's mean and scale
+  ESR_mean = initial_scaler.mean_[ESR_index]
+  ESR_scale = initial_scaler.scale_[ESR_index]
+
+  CRP_mean = initial_scaler.mean_[CRP_index]
+  CRP_scale = initial_scaler.scale_[CRP_index]
+
+  # Clinical thresholds for inflammation status
+  ESR_clinical_threshold = 20.0
+  CRP_clinical_threshold = 5.0
+
+  # Calculating the Z-score of the threshold (because ESR and CRP in balanced DFs are already scaled)
+  Z_ESR_threshold = (ESR_clinical_threshold - ESR_mean) / ESR_scale
+  Z_CRP_threshold = (CRP_clinical_threshold - CRP_mean) / CRP_scale
+
+  # Creating the features
+  lime_row = imputed_row.copy()
+
+  for row in [imputed_row, lime_row]:
+    # Ratio of acute phase reactants
+    row['CRP_ESR_ratio'] = row['CRP'] / row['ESR']
+    row['RF_antiCCP_ratio'] = row['RF'] / row['antiCCP']
+    row['C3_C4_ratio'] = row['C3'] / row['C4']
+
+    # Immunological activity scores
+    # Extractable Nuclear Antigen (ENA) Count
+    row['ena_count'] = row['antiRo'] + row['antiLa'] + row['antiSm']
+    row['systemic_autoantibody_count'] = row['ANA'] + row['antiDsDNA'] + row['antiSm']
+    row['rf_antibody_score'] = row['RF'] * (row['antiCCP'] + 1)
+
+    # Interaction and status features
+    if row is imputed_row:
+      row['inflammation_status'] = np.where(
+        (row['ESR'] > Z_ESR_threshold) | (row['CRP'] > Z_CRP_threshold),
+        1, # Value to put if True
+        0  # Value to put if False
+      )
+    else:
+      row['inflammation_status'] = np.where(
+        (row['ESR'] > ESR_clinical_threshold) | (row['CRP'] > CRP_clinical_threshold),
+        1, # Value to put if True
+        0  # Value to put if False
+      )
+
+
+    row['spondyloarthropathy_risk'] = row['HLA_B27'] * row['age']
+
+  # RE-SCALING FEATURES
+  # Features to scale (non-binary)
+  final_continuous_features = ['age', 'ESR', 'CRP', 'RF', 'antiCCP', 'C3', 'C4', 'CRP_ESR_ratio', 'RF_antiCCP_ratio', 'C3_C4_ratio', 'ena_count', 'systemic_autoantibody_count', 'rf_antibody_score', 'spondyloarthropathy_risk']
+
+  # Get binary features
+  final_binary_features = imputed_row.columns.drop(final_continuous_features).tolist()
+
+  new_column_order_final = final_continuous_features + final_binary_features
+
+  # imputed_row = imputed_row[new_column_order_final]
+  scaled_row_array_final = preprocessor_2.transform(imputed_row)
+
+  # Reassemble the DataFrame
+  # Scaled features first, then passthrough features (continuous + binary)
+  final_scaled_row = pd.DataFrame(scaled_row_array_final, columns=new_column_order_final)
+
+  lime_row = lime_row[new_column_order_final]
+
+  final_scaled_row_array = final_scaled_row.values
+  lime_row_array = lime_row.values
+
+  return final_scaled_row_array, lime_row_array
+
+# Retrieving the autoimmune rheumatic disease class prediction
+def get_prediction(transformed_data):
+    """
+    Takes the transformed, runs it through the CatBoostClassifier (CBC) model, and returns probabilities and the top class index.
+    """
+    # CatBoost model's predict_proba() function returns a 2D array for 2D inputs
+    # Even for one row (individual prediction), it will return shape of (1, n_classes)
+    probabilities = model.predict_proba(transformed_data.reshape(1, -1))[0]
+    top_class_idx = np.argmax(probabilities)
+
+    return probabilities, top_class_idx
+
+# Display the autoimmune rheumatic disease prediction results
+def display_results(probabilities, top_class_idx):
+    """
+    Renders the autoimmune rheumatic disease prediction results in the Streamlit UI.
+    """
+    predicted_disease = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES[top_class_idx]
+    confidence = probabilities[top_class_idx]
+
+    st.header("Autoimmune Rheumatic Diagnostic Prediction Results")
+
+    # 1. Main callout
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.subheader(f"Most likely diagnosis: **{predicted_disease}**")
+        st.progress(float(confidence), text=f"Confidence: {confidence * 100:.1f}%")
+    with col2:
+        st.metric(label="Highest Probability", value=f"{confidence * 100:.1f}%")
+
+    st.divider()
+
+    # 2. Probability breakdown table and chart
+    st.subheader("Probability distribution across all conditions")
+
+    # Create a DataFrame for display
+    results_df = pd.DataFrame({
+        "Condition": AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES,
+        "Probability (%)": [round(p * 100, 2) for p in probabilities]
+    }).sort_values(by="Probability (%)", ascending=False)
+
+    # Use columns to show the table and chart side-by-side
+    chart_col, table_col = st.columns([3, 2])
+
+    with chart_col:
+        # Simple horizontal bar chart
+        st.bar_chart(results_df, x="Condition", y="Probability (%)", color="#007bff", horizontal=True, sort="-Probability (%)")
+
+    with table_col:
+        st.dataframe(results_df, hide_index=True, width='stretch')
+
+    # 3. Warning to the clinician/user regarding the limitations of this Streamlit application
+    st.warning(
+        ":red-background[**Note**] This application is a diagnostic clinical decision support aid generated by a ***machine learning model***. Clinical correlation and confirmation by a rheumatologist or another relevant specialist is **MANDATORY**!")
+
+# Convert a Matplotlib figure to a PIL image
+def get_pil_image_from_matplotlib(figure):
+    buffer = BytesIO()
+    figure.savefig(buffer, format='png')
+    buffer.seek(0)
+    return Image.open(buffer)
+
+# Convert a Plotly figure to a PIL image
+def get_pil_image_from_plotly(figure):
+    image_bytes = figure.to_image(format="png")
+    return Image.open(BytesIO(image_bytes))
+
+
+def explain_graph_with_llm(is_plotly, figure, figure_context=None):
+    if is_plotly:
+        st.session_state['pending_explainer_image'] = get_pil_image_from_plotly(figure)
+    else:
+        st.session_state['pending_explainer_image'] = get_pil_image_from_matplotlib(figure)
+
+    st.session_state['pending_figure_context'] = figure_context
+    st.rerun()
+
+def display_global_interpretability(global_shap_values, global_shap_explanation, feature_names, X_sample, top_class_idx):
+    st.divider()
+    st.header("Global Model Insights")
+    st.write("These charts show which features influence the prediction of the machine learning model across all patients.")
+
+    st.subheader("Differential Analysis")
+    st.write(
+        "Select a condition to see the global influences of features for a specific condition.")
+
+    # Default to the top prediction, but have an option for choosing other conditions
+    global_selected_class_name = st.selectbox(
+        "View analysis for:",
+        options=AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES,
+        index=int(top_class_idx),
+        key='global_shap_disease_selectbox'
+    )
+
+    # Get the index of the selected condition
+    analysis_idx = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES.index(global_selected_class_name)
+    top_disease = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES[top_class_idx]
+    selected_disease = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES[analysis_idx]
+
+    if analysis_idx == top_class_idx:
+        st.write(f"The predicted condition, :yellow-background[{top_disease}], is currently :green-background[**selected**].")
+    else:
+        st.write(f"The predicted condition, :yellow-background[{top_disease}], is currently :red-background[***not selected***].")
+
+    st.markdown("<a name='global_shap'></a>", unsafe_allow_html=True)
+    tabs = st.tabs(["Feature Importance", "Feature Impact (Beeswarm)", "Feature Dependence"])
+
+    with tabs[0]:
+        # Calculate global average absolute SHAP values
+        st.write(f"The feature importance graph shows how important a feature is in a prediction, :yellow-background[*regardless of a specific condition*].")
+        figure_context = "A global SHAP feature importance graph that shows how important a feature is in a prediction, regardless of a specific condition."
+
+        shap_abs_mean = np.abs(np.array(global_shap_values)).mean(axis=(0, 2))
+
+        df_global_shap = pd.DataFrame({
+            'Feature': feature_names,
+            'Mean Absolute SHAP': shap_abs_mean
+        }).sort_values(by='Mean Absolute SHAP', ascending=True)
+
+        fig_global = px.bar(
+            df_global_shap,
+            x='Mean Absolute SHAP',
+            y='Feature',
+            orientation='h',
+            title='Overall Feature Importance',
+            color_discrete_sequence=['#007bff']
+        )
+
+        st.plotly_chart(fig_global, width='stretch')
+
+        if st.button(
+            label="Explain this graph for me",
+            key='global_feature_importance_explainer_button',
+            help='Use the LLM Clinical Assistant to explain the Global Feature Importance graph',
+            type='primary',
+            icon=':material/chat_add_on:',
+            width='stretch'
+        ):
+            explain_graph_with_llm(True, fig_global, figure_context=figure_context)
+
+    with tabs[1]:
+        # Beeswarm plot (using Matplotlib)
+        st.write(f"The beeswarm graph shows how higher or lower values of a feature generally influence the model to lean :green-background[towards] or :red-background[away] from predicting the :yellow-background[{selected_disease}] condition.")
+        figure_context = f"A SHAP global beeswarm graph that shows how higher or lower values of a feature generally influence the model to lean towards or away from predicting the {selected_disease} condition."
+
+        # Get the SHAP values
+        beeswarm_shap_values = explainer(X_sample)
+
+        # Index the SHAP values: [all rows, all features, highest probability class]
+        shap.plots.beeswarm(beeswarm_shap_values[:, :, analysis_idx], max_display=22)
+        # Pass the plot to Streamlit
+        st.pyplot(plt.gcf())
+        beeswarm_plot = plt.gcf()
+        plt.close()
+
+        if st.button(
+            label="Explain this graph for me",
+            key='global_beeswarm_explainer_button',
+            help='Use the LLM Clinical Assistant to explain the Global Feature Impact graph',
+            type='primary',
+            icon=':material/chat_add_on:',
+            width='stretch'
+        ):
+            explain_graph_with_llm(False, beeswarm_plot, figure_context=figure_context)
+
+    with tabs[2]:
+        # Feature dependence plot (also using Matplotlib)
+        st.write(f"The feature dependence graph shows how the risk of the :yellow-background[{selected_disease}] condition :green-background[rises] or :red-background[falls] along the (scaled with mean of 0 and standard deviation of 1) values of a specific feature.")
+        st.write("Select a feature to see how its value affects the prediction probability.")
+
+        # Select box for selected feature
+        selected_feature = st.selectbox("Select feature to analyse:", feature_names, key="global_dependence_feature")
+
+        # Checkbox to toggle secondary feature interaction colour effect
+        show_secondary_interaction = st.checkbox(f"Colour the effects between {selected_feature} and the feature it has the strongest interaction with", value=True, key="toggle_interaction")
+
+        if show_secondary_interaction:
+            figure_context = f"A SHAP global feature dependence graph that shows how the risk of the {selected_disease} condition rises or falls along the (scaled with mean of 0 and standard deviation of 1) values of {selected_feature}. Note that a second feature is included where it has the strongest interaction effects with {selected_feature}."
+        elif not show_secondary_interaction:
+            figure_context = f"A SHAP global feature dependence graph that shows how the risk of the {selected_disease} condition rises or falls along the (scaled with mean of 0 and standard deviation of 1) values of {selected_feature}."
+
+        # Generate feature dependence (scatter) plot
+        # Filter to the predicted disease class
+        disease_explanation = global_shap_explanation[:, :, analysis_idx]
+
+        if show_secondary_interaction:
+            shap.plots.scatter(disease_explanation[:, selected_feature], color=disease_explanation)
+        else:
+            shap.plots.scatter(disease_explanation[:, selected_feature])
+
+        st.pyplot(plt.gcf())
+        feature_dependence_plot = plt.gcf()
+        plt.close()
+
+        if st.button(
+            label="Explain this graph for me",
+            key='global_feature_dependence_explainer_button',
+            help='Use the LLM Clinical Assistant to explain the Global Feature Dependence graph',
+            type='primary',
+            icon=':material/chat_add_on:',
+            width='stretch'
+        ):
+            explain_graph_with_llm(False, feature_dependence_plot, figure_context=figure_context)
+
+def display_local_shap_interpretability(transformed_data, top_class_idx):
+    st.divider()
+    st.header("Patient-Specific Analysis")
+    st.subheader("Local Shapley Additive Explanations (SHAP)")
+
+    st.subheader("Differential Analysis")
+    st.write("Select a condition to see why the machine learning model supported or discounted it specifically for this patient.")
+
+    # Default to the top prediction, but have an option for choosing other conditions
+    local_shap_selected_class_name = st.selectbox(
+        "View analysis for:",
+        options=AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES,
+        index=int(top_class_idx),
+        key='local_shap_disease_selectbox'
+    )
+
+    # Get the index of the selected condition
+    analysis_idx = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES.index(local_shap_selected_class_name)
+    global top_disease
+    top_disease = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES[top_class_idx]
+    selected_disease = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES[analysis_idx]
+
+    if analysis_idx == top_class_idx:
+        st.write(f"The predicted condition, :yellow-background[{top_disease}], is currently :green-background[**selected**].")
+    else:
+        st.write(f"The predicted condition, :yellow-background[{top_disease}], is currently :red-background[***not selected***].")
+    # Calculate SHAP for the input patient
+    # This returns a list of arrays (one per class)
+    patient_shap_values = explainer.shap_values(transformed_data)
+
+    # Extract values for the predicted class and flatten it to 1D
+    # Take the array for analysis_idx and flatten it to ensure the shape is (22,) which is 1D, and not (1, 22), which is 2D
+    # Convert to a numpy array to check shape
+    patient_shap_array = np.array(patient_shap_values)
+
+    # If the shape is 3D (rows, features, classes), format to:
+    # All rows (only 1 or the input patient), all features, predicted class
+    global current_patient_shap_1d
+    if len(patient_shap_array.shape) == 3:
+        current_patient_shap_1d = patient_shap_array[0, :, analysis_idx]
+    else:
+        # If list style, just flatten the array given the predicted class
+        current_patient_shap_1d = patient_shap_array[analysis_idx].flatten()
+
+    base_values = explainer.expected_value
+
+    if isinstance(base_values, (list, np.ndarray)) and len(base_values) > analysis_idx:
+        base_value = base_values[analysis_idx]
+    else:
+        base_value = base_values  # Fallback if it's a scalar
+
+    tabs = st.tabs(["Bar Plot", "Force Plot", "Waterfall Plot"])
+
+    # Bar plot
+    with tabs[0]:
+        if analysis_idx == top_class_idx:
+            st.write(f"Top features driving the prediction :green-background[***for***] :yellow-background[{selected_disease}]:")
+            figure_context = f"A local SHAP bar plot, showing the top features driving the prediction for {selected_disease}."
+        else:
+            st.write(f"Top features driving the prediction :red-background[***away from***] :yellow-background[{selected_disease}]:")
+            figure_context = f"A local SHAP bar plot, showing the top features driving the prediction away from {selected_disease}."
+
+        df_bar = pd.DataFrame({
+            'Feature': FINAL_FEATURE_NAMES,
+            'SHAP Value': current_patient_shap_1d
+        })
+
+        df_bar['Absolute SHAP Value'] = df_bar['SHAP Value'].abs()
+        df_bar = df_bar.sort_values(by='Absolute SHAP Value', ascending=False)
+
+        fig_bar = px.bar(
+            df_bar,
+            x='SHAP Value',
+            y='Feature',
+            orientation='h',
+            color=df_bar['SHAP Value'] > 0,
+            color_discrete_map={True: '#636efa', False: '#ef553b'},
+            labels={'SHAP Value': 'Impact Score'}
+        )
+        fig_bar.update_layout(showlegend=False, yaxis={'categoryorder': 'total ascending'})
+        st.plotly_chart(fig_bar, width='stretch')
+
+        if st.button(
+            label="Explain this graph for me",
+            key='local_shap_bar_explainer_button',
+            help='Use the LLM Clinical Assistant to explain the Local SHAP Bar Plot',
+            type='primary',
+            icon=':material/chat_add_on:',
+            width='stretch'
+        ):
+            explain_graph_with_llm(True, fig_bar, figure_context=figure_context)
+
+    # Force plot
+    with tabs[1]:
+        st.write(f"This force plot shows how each feature from the patient pushed stronger or weaker towards the prediction of the :yellow-background[{selected_disease}] condition.")
+
+        figure_context = f"A local SHAP force plot that shows how much each feature from the patient pushed stronger or weaker towards the prediction of the {selected_disease} condition."
+
+        # HTML wrapper function because force plot is done in JavaScript
+        def call_html_force_plot(plot, height=None):
+            # Wrap the JS and the plot HTML in a format Streamlit can render
+            shap_html = f"""
+                    <head>
+                        {shap.getjs()}
+                        <style>
+                            body {{
+                                background-color: white !important;
+                                margin: 0;
+                                padding: 10px;
+                                font-family: sans-serif;
+                            }}
+                        </style>
+                    </head>
+                    <body>
+                        <div style="background-color: white; padding: 10px; border-radius: 5px;">
+                            {plot.html()}
+                        </div>
+                    </body>
+                    """
+            components.html(shap_html, height=height)
+
+        # Generate the force plot
+        # Use flatten() for the data to ensure it is a 1D vector of values
+        force_plot = shap.force_plot(
+            base_value,
+            current_patient_shap_1d,
+            transformed_data.flatten(),
+            feature_names=FINAL_FEATURE_NAMES,
+            matplotlib=False  # Set to False for the interactive JS version for Streamlit
+        )
+
+        # Call the help function to render the force plot
+        call_html_force_plot(force_plot, height=200)
+
+        if st.button(
+            label="Explain this graph for me",
+            key='local_shap_force_explainer_button',
+            help='Use the LLM Clinical Assistant to explain the Local SHAP Force Plot',
+            type='primary',
+            icon=':material/chat_add_on:',
+            width='stretch'
+        ):
+            # Have to use Matplotlib version to pass to LLM
+            shap.force_plot(
+                base_value,
+                current_patient_shap_1d,
+                transformed_data.flatten(),
+                feature_names=FINAL_FEATURE_NAMES,
+                show=False,
+                matplotlib=True  # Set to True for the LLM explainer version
+            )
+
+            force_plot_figure = plt.gcf()
+            force_plot_figure.set_size_inches(12, 3)
+
+            explain_graph_with_llm(False, force_plot_figure, figure_context=figure_context)
+
+    # Waterfall plot
+    with tabs[2]:
+        st.write(f"The waterfall plot shows how the patient's data starts from patient average to the input patient's particular prediction for the :yellow-background[{selected_disease}] condition.")
+        figure_context = f"A local SHAP waterfall plot that shows how the patient's data starts from patient average to the input patient's particular prediction for the {selected_disease} condition."
+
+        # Use an Explanation object
+        # Create a temporary Explanation object for the input patient
+        explanation = shap.Explanation(
+            values=current_patient_shap_1d,
+            base_values=base_value,
+            data=transformed_data.flatten(),
+            feature_names=FINAL_FEATURE_NAMES
+        )
+
+        fig_waterfall, ax_waterfall = plt.subplots(figsize=(10, 6))
+        shap.plots.waterfall(explanation, max_display=10, show=False)
+        st.pyplot(fig_waterfall)
+        waterfall_plot_figure = plt.gcf()
+        plt.close()
+
+        if st.button(
+            label="Explain this graph for me",
+            key='local_shap_waterfall_explainer_button',
+            help='Use the LLM Clinical Assistant to explain the Local SHAP Waterfall Plot',
+            type='primary',
+            icon=':material/chat_add_on:',
+            width='stretch'
+        ):
+            explain_graph_with_llm(False, waterfall_plot_figure, figure_context=figure_context)
+
+def prepare_shap_summary_for_gemini(current_patient_shap_1d, feature_names):
+    # Create a DataFrame to sort impacts
+    df = pd.DataFrame({'Feature': feature_names, 'Impact': current_patient_shap_1d})
+    df['Abs_Impact'] = df['Impact'].abs()
+    top_drivers = df.sort_values(by='Abs_Impact', ascending=False).head(10)
+
+    summary = ""
+    for _, row in top_drivers.iterrows():
+        direction = "Positive (Supporting)" if row['Impact'] > 0 else "Negative (Opposing)"
+        summary += f"- {row['Feature']}: {direction} SHAP impact of {row['Impact']:.4f}\n"
+    return summary
+
+def run_chatbot_interface(predicted_disease, probabilities, feature_names, current_shap_1d, explainer_image=None, figure_context=None):
+    # Sidebar chat window
+    with st.sidebar:
+        st.markdown(
+            """
+        <style>
+        .st-emotion-cache-155jwzh {
+            overflow: hidden;
+        }
+            .st-emotion-cache-10p9htt {
+            height: 1rem;
+            }
+        </style>
+        """,
+            unsafe_allow_html=True,
+        )
+
+        # Header and clear chat layout
+        header_column, button_column = st.columns(spec=[0.7, 0.3], gap='small', vertical_alignment='center', width='stretch')
+
+        with header_column:
+            st.header(":material/forum: LLM Clinical Assistant")
+
+        with button_column:
+            st.write('')
+            # if st.button('**Clear Chat**', help="Delete all messages and reset the AI's context", icon=':material/delete:', type='primary', width='stretch'):
+
+
+
+            # Initialise the confirmation state if it has not existed yet
+            if 'confirm_delete_chat' not in st.session_state:
+                st.session_state.confirm_delete_chat = False
+
+            # Show the main Clear Chat button if not in confirmation mode
+            if not st.session_state.confirm_delete_chat:
+                if st.button('**Clear Chat**', help="Delete all messages and reset the Clinical Assistant's context", icon=':material/delete:', type='primary', width='stretch'):
+                    st.session_state.confirm_delete_chat = True
+                    st.rerun()
+            else:
+                # We are in confirmation mode: show either Yes and No
+                st.write("**:red[Are you sure?]**")
+                col_yes, col_no = st.columns(2)
+
+                with col_yes:
+                    if st.button("Yes", type="primary", key="confirm_yes_delete_chat", width='stretch', help="This action cannot be undone!"):
+                        # Reset all messages currently in the session state (wiping visual messages)
+                        st.session_state.messages = []
+
+                        if "chat_session" in st.session_state:
+                            del st.session_state.chat_session
+
+                        # Set the confirm delete chat toggle back to False
+                        st.session_state.confirm_delete_chat = False
+
+                        # Rerun the chatbot to show the changes
+                        st.rerun()
+
+                with col_no:
+                    if st.button("No", key="confirm_no_delete_chat", width='stretch', help='Cancel this action'):
+                        # Set the confirm delete chat toggle back to False
+                        st.session_state.confirm_delete_chat = False
+
+                        # Refresh the chatbot page
+                        st.rerun()
+
+
+
+
+
+                # # Reset all messages currently in the session state (wiping visual messages)
+                # st.session_state.messages = []
+                #
+                # # Reset all chat history from the Gemini chat session (wiping Gemini's AI context)
+                # if "chat_session" in st.session_state:
+                #     del st.session_state.chat_session
+                #
+                # # Restart the chatbot clinical assistant for changes to take effect
+                # st.rerun()
+
+        st.success(f":violet-background[**Context**] Currently analysing the diagnosis of ***{predicted_disease}*** in the patient", icon=':material/search_activity:')
+        # st.info(f":orange-background[**Instructions**] Use the LLM to query about what the SHAP values obtained means, how the SHAP values explain influences in patient features that led to this prediction, and more.", icon=':material/chat_info:')
+        st.warning(f":red-background[**Note**] The responses generated from this chat are produced by generative artificial intelligence (GenAI). Please take due diligence in validating the information generated against verified medical knowledge.", icon=':material/exclamation:')
+
+        # Container for prompts and responses
+        chat_container = st.container(height=500)
+
+        # If a chat session has not started yet, start it and keep it in the session
+        if "chat_session" not in st.session_state:
+            # Intitialise history of messages
+            history = []
+
+            # Append any messages into the history
+            for message in st.session_state.messages:
+                role = "model" if message["role"] == "assistant" else "user"
+                history.append({"role": role, "parts": [{"text": message["content"]}]})
+
+            st.session_state.chat_session = gemini.chats.create(
+                model="gemini-2.5-flash-lite",
+                config=GenerateContentConfig(
+                    system_instruction=[
+                        "You are an AI for an autoimmune rheumatology disease diagnosis machine learning model, as part of a clinical decision support system.",
+                        "The possible conditions to be classified in the model are either: Ankylosing Spondylitis, Normal, Psoriatic Arthritis, Reactive Arthritis, Rheumatoid Arthritis, Sjögren\'s Syndrome, or Systemic Lupus Erythematosus.",
+                        "Usually, the initial prompt the user sends will be of the predicted autoimmune rheumatic disease, with its confidence in %.",
+                        "The prediction model uses a machine learning model with global and local SHAP graphs to add to the explainability factor of the prediction.",
+                        "A summary of the key local SHAP drivers of the prediction is typically also sent in a user's initial prompt.",
+                        "As the computer-science-to-natural-language translation layer, you will be the one to translate the SHAP graphs (that are difficult to interpret by clinicians and others) into natural-language terms that they can understand.",
+                        "Answer briefly and be clinically accurate as much as possible. It is essential that you maximise interpretability of the prediction and explainability graphs to support the clinician.",
+                        "Refer to specific lab values when possible."
+                    ]
+                ),
+                history=history
+            )
+
+        # In the chat container, display chat messages according to their roles from history on app rerun
+        with chat_container:
+            for message in st.session_state.messages:
+                with st.chat_message(message["role"]):  # Display the chat message according to the role
+                    st.markdown(message["content"])     # Display the text prompt
+                    if "images" in message:             # If there were any images in the prompt
+                        for image in message["images"]: # For each image in the prompt
+                            st.image(image)             # Display the image
+
+        # React to user input
+        prompt = st.chat_input(placeholder="Ask about this diagnosis...",
+                                accept_file="multiple",
+                                file_type=["jpg", "jpeg", "png"])
+
+        user_text = ""
+        user_files = []
+
+        # explainer_image is not None when a user presses a button to explain a graph
+        # That image is passed into a run chatbot interface call with explainer_image as the image
+        if explainer_image is not None:
+            user_text = "Explain this graph for me"
+            user_files.append(explainer_image)
+        # There was no explainer image passed and there was text in the chat input box
+        elif prompt:
+            # Extract the text and files from the chat_input (dictionary)
+            user_text = prompt["text"]
+            user_files = prompt["files"]
+
+        # Neither of these two scenarios happened, so exit the function
+        else:
+            return
+
+        # Add the current prompt to chat context
+        st.session_state.messages.append({
+            "role": "user",
+            "content": user_text, # The text prompt
+            "images": user_files.copy() # Any images sent as part of the prompt
+        })
+
+        # Display user messages and files in chat message container
+        with chat_container:
+            with st.chat_message("user"):
+                # Display the message
+                st.markdown(user_text)
+
+                # Then display any images (if there are any)
+                for file in user_files:
+                    st.image(file)
+
+                # Prepare multimodal message parts for Gemini
+                # Prepare SHAP data for Gemini's context
+                summary_data = prepare_shap_summary_for_gemini(current_shap_1d, feature_names)
+
+                # Context about the figure from the "Explain this graph for me" button can be inserted here, if available
+                if figure_context is not None:
+                    text_part = f"""
+                                            Patient Prediction: {predicted_disease} ({max(probabilities) * 100:.2f}% confidence)
+                                            Key SHAP Drivers: {summary_data}
+                                            Graph Context: {figure_context}
+                                            Explain this graph as if the user does not understand how to interpret a SHAP explainability graph from the diagnosis. Make it easy to understand.
+                                        """
+
+                else:
+                    text_part = f"""
+                        Patient Prediction: {predicted_disease} ({max(probabilities) * 100:.2f}% confidence)
+                        Key SHAP Drivers: {summary_data}
+                        User Question: {user_text}
+                    """
+
+                # Flatten the text part to match Gemini's input requirements
+                message_parts = [text_part]
+
+                for file in user_files:
+                    if isinstance(file, Image.Image):
+                        message_parts.append(file)
+                    else:
+                        image = Image.open(file)
+                        message_parts.append(image)
+
+            with st.chat_message("assistant"):
+                response_placeholder = st.empty()
+                full_response_text = ""
+
+                # Send the message to Gemini using the session in session_state
+                response_stream = st.session_state.chat_session.send_message_stream(message=message_parts)
+
+                # Iterate through the generator
+                for chunk in response_stream:
+                    # Each chunk is a GenerateContentResponse object
+                    # The Gemini API provides a shortcut .text property on the chunk (instead of finding the child of many JSON objects)
+                    # If a chunk is available
+                    if chunk.text:
+                        # Update the full response with the new chunk
+                        full_response_text += chunk.text
+                        # Update the UI of the response with the accumulated text and a cursor (here, a pipe)
+                        response_placeholder.markdown(full_response_text + "|")
+
+                # Final update to remove the cursor
+                response_placeholder.markdown(full_response_text)
+
+        # Save the response from Gemini to the history
+        st.session_state.messages.append({"role": "assistant", "content": full_response_text})
+        st.rerun() # Refresh the chatbot to clean the UI
+
+# App code
+# Declare and set the UI
+st.markdown("""
+    <style>
+    .main { background-color: #f5f7f9; }
+    .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #007bff; color: white; }
+    </style>
+    """, unsafe_allow_html=True)
+
+st.title("Autoimmune Rheumatic Diagnosis Decision Support System")
+st.write("Please enter a patient's clinical data below to generate a diagnostic probability analysis between normal and 6 possible autoimmune rheumatic diseases.")
+
+with st.form("clinical_form"):
+    # Group 1: Demographics and inflammation
+    st.subheader("1. Patient Demographics & Inflammatory Markers")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        age = st.number_input("Age", min_value=18, max_value=100, value=45, help="Patient age (18 to 100 years)")
+        gender = st.selectbox("Gender", options=[0, 1], format_func=lambda x: "Female" if x == 0 else "Male")
+
+    with col2:
+        esr = st.number_input("Erythrocyte Sedimentation Rate (ESR, mm/hr)", min_value=0.0, max_value=150.0, value=15.0, help="Normal: Male < 15, Female < 20")
+        crp = st.number_input("C-Reactive Protein (CRP, mg/L)", min_value=0.0, max_value=300.0, value=3.0, help="Normal range: 0.1 to 3.0 mg/L")
+
+    st.divider()
+
+    # Group 2: Serology & specific antibodies
+    st.subheader("2. Serology & Autoantibodies")
+    col3, col4 = st.columns(2)
+
+    with col3:
+        rf = st.number_input("Rheumatoid Factor (RF, IU/ml)", min_value=0.0, max_value=500.0, value=10.0, help="Normal range: 0.1 to 3.0 IU/ml")
+        anti_ccp = st.number_input("Anti-Cyclic Citrullinated Peptide (anti-CCP, U/mL)", min_value=0.0, max_value=500.0, value=10.0, help="Normal range: 0.0 - 20.0 U/mL")
+        hla_b27 = st.selectbox("Human Leukocyte Antigen B27 (HLA-B27)", options=[0, 1], format_func=lambda x: "Negative" if x == 0 else "Positive")
+        ana = st.selectbox("Anti-Nuclear Antibody (ANA)", options=[0, 1], format_func=lambda x: "Negative" if x == 0 else "Positive")
+
+    with col4:
+        anti_ro = st.selectbox("Anti-Ro/SSA Antibodies", options=[0, 1], format_func=lambda x: "Negative" if x == 0 else "Positive")
+        anti_la = st.selectbox("Anti-La/SSB Antibodies", options=[0, 1], format_func=lambda x: "Negative" if x == 0 else "Positive")
+        anti_dsdna = st.selectbox("Anti-double stranded DNA Antibodies (anti-dsDNA)", options=[0, 1], format_func=lambda x: "Negative" if x == 0 else "Positive")
+        anti_sm = st.selectbox("Anti-Smith Antibodies (anti-Sm)", options=[0, 1], format_func=lambda x: "Negative" if x == 0 else "Positive")
+
+    st.divider()
+
+    # Group 3: Complement System
+    st.subheader("3. Complement Components")
+    col5, col6 = st.columns(2)
+
+    with col5:
+        c3 = st.number_input("Complement Component 3 (C3, mg/dL)", min_value=0.0, max_value=300.0, value=120.0,
+                             help="Normal ranges: Male 90 to 180 mg/dL, Female 88 to 206 mg/dL")
+
+    with col6:
+        c4 = st.number_input("Complement Component 4 (C4, mg/dL)", min_value=0.0, max_value=150.0, value=30.0,
+                             help="Normal ranges: Male 12 to 72 mg/dL, Female 13 to 75 mg/dL")
+
+    st.write("")  # Spacing
+    submit = st.form_submit_button("Run Autoimmune Rheumatic Diagnostic Analysis")
+
+# Processing the input once the Submit button has been clicked
+# Initialise the clicked state and LLM messages if it has not existed yet
+if 'clicked' not in st.session_state:
+    st.session_state.clicked = False
+
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+
+if submit:
+    st.session_state.clicked = True
+    with st.spinner("Analysing patient's clinical data..."):
+        try:
+            # 1) Gather all inputs into a dictionary matching what transform_data() expects
+            # Format of transform_data()'s raw_input_data
+            # ['age',
+            #  'gender',
+            #  'ESR',
+            #  'CRP',
+            #  'RF',
+            #  'antiCCP',
+            #  'HLA_B27',
+            #  'ANA',
+            #  'antiRo',
+            #  'antiLa',
+            #  'antiDsDNA',
+            #  'antiSm',
+            #  'C3',
+            #  'C4']
+
+            raw_input_data = {
+                'age': age,
+                'gender': gender,
+                'ESR': esr,
+                'CRP': crp,
+                'RF': rf,
+                'antiCCP': anti_ccp,
+                'HLA_B27': hla_b27,
+                'ANA': ana,
+                'antiRo': anti_ro,
+                'antiLa': anti_la,
+                'antiDsDNA': anti_dsdna,
+                'antiSm': anti_sm,
+                'C3': c3,
+                'C4': c4
+            }
+
+            # 2) Transform the raw input data
+            transformed_data, lime_data = transform_data(raw_input_data)
+
+            # 3) Calculate the autoimmune rheumatic disease class with the highest probability
+            probabilities, top_class_idx = get_prediction(transformed_data)
+
+            # 4) Display the results of the prediction
+            display_results(probabilities, top_class_idx)
+
+            # 5) Store in session state for Gemini LLM usage later
+            st.session_state.results = {
+                'probabilities': probabilities,
+                'top_class_idx': top_class_idx,
+                'transformed_data': transformed_data
+            }
+
+        except Exception as e:
+            # Extract traceback information
+            exception_type, exception_object, exception_traceback = sys.exc_info()
+            exception_filename = os.path.split(exception_traceback.tb_frame.f_code.co_filename)[1]
+            exception_line_no = exception_traceback.tb_lineno
+
+            # Get the full detailed string of the error
+            detailed_error = traceback.format_exc()
+
+            # Display a user-friendly message + technical details
+            st.error(f"Error in {exception_filename} at Line {exception_line_no}")
+            st.warning(f"Error Type: {exception_type.__name__}")
+            st.info(f"Message: {e}")
+
+            # Create an expandable section for the full Traceback (helpful for debugging)
+            with st.expander("View the full error traceback"):
+                st.code(detailed_error)
+
+    display_global_interpretability(global_shap_values, global_shap_explanation, FINAL_FEATURE_NAMES, X_sample, top_class_idx)
+
+    display_local_shap_interpretability(transformed_data, top_class_idx)
+
+    st.session_state['last_prediction'] = {
+        'predicted_disease': AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES[top_class_idx],
+        'probabilities': probabilities,
+        'scaled_data': transformed_data,
+        'lime_data': lime_data,
+        'current_patient_shap_1d': current_patient_shap_1d
+    }
+
+    prepare_shap_summary_for_gemini(current_patient_shap_1d, FINAL_FEATURE_NAMES)
+
+    # run_chatbot_interface(top_disease, probabilities, FINAL_FEATURE_NAMES, current_patient_shap_1d)
+
+# If the website is refreshed, and a button has been clicked already
+elif st.session_state.clicked:
+
+    # Retrieve the past result
+    result = st.session_state.results
+    last_prediction = st.session_state['last_prediction']
+
+    # Restore the result and plots
+    display_results(result['probabilities'], result['top_class_idx'])
+
+    display_global_interpretability(
+        global_shap_values,
+        global_shap_explanation,
+        FINAL_FEATURE_NAMES,
+        X_sample,
+        result['top_class_idx']
+    )
+
+    display_local_shap_interpretability(
+        result['transformed_data'],
+        result['top_class_idx']
+    )
+
+if st.session_state.clicked:
+    # Get explainer image and explainer image context if they exist, then clear them to avoid any triggers twice
+    explainer_image = st.session_state.get('pending_explainer_image')
+    explainer_figure_context = st.session_state.get('pending_figure_context')
+
+    # Clear the pending state so it does not loop
+    if 'pending_explainer_image' in st.session_state:
+        del st.session_state['pending_explainer_image']
+    if 'pending_figure_context' in st.session_state:
+        del st.session_state['pending_figure_context']
+
+    last_prediction = st.session_state['last_prediction']
+
+    run_chatbot_interface(
+        last_prediction['predicted_disease'],
+        last_prediction['probabilities'],
+        FINAL_FEATURE_NAMES,
+        last_prediction['current_patient_shap_1d'],
+        explainer_image=explainer_image,
+        figure_context=explainer_figure_context
+    )
