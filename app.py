@@ -25,9 +25,6 @@ from io import BytesIO
 import os
 import kaleido
 
-# Fix of kaleido with Streamlit
-kaleido.get_chrome_sync()
-
 # Unused imports
 # from sdv.utils import load_synthesizer
 # import torch
