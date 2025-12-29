@@ -7,4 +7,4 @@ For the project titled: "Autoimmune and rheumatic disease detection with LLM-aug
 
 Powered by Python, Google Gemini, and Streamlit.
 
-Link to web app: autoimmune-rheumatic-dss.streamlit.app
+Link to web app: https://autoimmune-rheumatic-dss.streamlit.app
