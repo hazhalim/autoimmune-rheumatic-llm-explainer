@@ -2,7 +2,7 @@
 
 For WIH3001: Data Science Project
 
-For the project titled: "Autoimmune and rheumatic disease detection with LLM-augmented explainable AI"
+For the project titled: "Autoimmune and rheumatic disease detection enhanced by LLM-augmented explainable AI"
 
 'Ammar Haziq bin Abdul Halim
 
