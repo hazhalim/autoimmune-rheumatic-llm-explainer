@@ -16,6 +16,8 @@ import plotly.express as px
 import matplotlib.pyplot as plt
 import shap
 import streamlit.components.v1 as components
+import lime
+import dill
 
 # Gemini imports
 from google import genai
@@ -24,6 +26,7 @@ from google.genai.types import GenerateContentConfig
 from io import BytesIO
 import os
 import kaleido
+from sklearn.neighbors import KNeighborsClassifier
 
 # Unused imports
 # from sdv.utils import load_synthesizer
@@ -86,10 +89,17 @@ def load_resources():
 
     gemini = genai.Client(api_key=GEMINI_API_KEY)
 
-    return p1, p2, knn, cbc, explainer, X_sample, global_shap_values, global_shap_explanation, GEMINI_API_KEY, gemini
+    # Load the LIME explainer using dill
+    with open('lime_explainer_final.pkl', 'rb') as file:
+        lime_explainer = dill.load(file)
+
+    # KNN imputer for LIME
+    knn_lime = joblib.load('knn_lime_imputer.joblib')
+
+    return p1, p2, knn, cbc, explainer, X_sample, global_shap_values, global_shap_explanation, GEMINI_API_KEY, gemini, lime_explainer, knn_lime
 
 # Immediately load the models
-preprocessor_1, preprocessor_2, knn_imputer, model, explainer, X_sample, global_shap_values, global_shap_explanation, GEMINI_API_KEY, gemini = load_resources()
+preprocessor_1, preprocessor_2, knn_imputer, model, explainer, X_sample, global_shap_values, global_shap_explanation, GEMINI_API_KEY, gemini, lime_explainer, knn_lime_imputer = load_resources()
 
 # Transforming input data function
 def transform_data(raw_input_data):
@@ -118,6 +128,9 @@ def transform_data(raw_input_data):
   # Check for any missing values, if there is, impute by CTGANSynthesizer with conditions if GPU is enabled, else use KNNImputer
   imputed_row = scaled_row.copy()
 
+  # Create imputed lime row here earlier in case there are no missing values
+  imputed_lime_row = loaded_row[new_column_order].copy()
+
   # torch.cuda_is_available() in place of False if GPU is available
   if scaled_row.isna().values.any() and False:
     row = scaled_row.copy()
@@ -145,14 +158,19 @@ def transform_data(raw_input_data):
 
     # Transform the row using KNNImputer
     imputed_row_array = knn_imputer.transform(scaled_row)
+    imputed_lime_row_array = knn_lime_imputer.transform(loaded_row)
 
     # Convert the imputed features back and its column names to a DataFrame (because imputer returns a NumPy array, not a DataFrame)
     imputed_row = pd.DataFrame(imputed_row_array, columns=scaled_row.columns)
+    imputed_lime_row = pd.DataFrame(imputed_lime_row_array, columns=scaled_row.columns)
 
     # Round the values of the binary columns
     for column in binary_columns:
         imputed_row[column] = np.round(imputed_row[column])
         imputed_row[column] = imputed_row[column].astype(int)
+
+        imputed_lime_row[column] = np.round(imputed_lime_row[column])
+        imputed_lime_row[column] = imputed_lime_row[column].astype(int)
 
   # FEATURE ENGINEERING
   # Get back the StandardScaler of the first feature scaling
@@ -178,9 +196,9 @@ def transform_data(raw_input_data):
   Z_CRP_threshold = (CRP_clinical_threshold - CRP_mean) / CRP_scale
 
   # Creating the features
-  lime_row = imputed_row.copy()
+  # lime_row = imputed_row.copy()
 
-  for row in [imputed_row, lime_row]:
+  for row in [imputed_row, imputed_lime_row]:
     # Ratio of acute phase reactants
     row['CRP_ESR_ratio'] = row['CRP'] / row['ESR']
     row['RF_antiCCP_ratio'] = row['RF'] / row['antiCCP']
@@ -206,8 +224,10 @@ def transform_data(raw_input_data):
         0  # Value to put if False
       )
 
-
     row['spondyloarthropathy_risk'] = row['HLA_B27'] * row['age']
+
+  imputed_row = imputed_row.mask(np.isinf(imputed_row), 0)
+  imputed_lime_row = imputed_lime_row.mask(np.isinf(imputed_lime_row), 0)
 
   # RE-SCALING FEATURES
   # Features to scale (non-binary)
@@ -225,12 +245,68 @@ def transform_data(raw_input_data):
   # Scaled features first, then passthrough features (continuous + binary)
   final_scaled_row = pd.DataFrame(scaled_row_array_final, columns=new_column_order_final)
 
-  lime_row = lime_row[new_column_order_final]
+  imputed_lime_row = imputed_lime_row[new_column_order_final]
 
   final_scaled_row_array = final_scaled_row.values
-  lime_row_array = lime_row.values
+  imputed_lime_row_array = imputed_lime_row.values
 
-  return final_scaled_row_array, lime_row_array
+  return final_scaled_row_array, imputed_lime_row_array
+
+def transform_lime_data(raw_input_data):
+    """
+    Specifically for LIME: Transforms raw input into the 22-feature unscaled
+    format required for the LIME graph labels.
+    """
+    # Handle Dictionary Input (Streamlit Form - 14 features)
+    if isinstance(raw_input_data, dict):
+        df = pd.DataFrame([raw_input_data])
+
+    # Handle NumPy Array Input (LIME - 22 features)
+    else:
+        data_array = np.array(raw_input_data)
+        if data_array.ndim == 1:
+            data_array = data_array.reshape(1, -1)
+
+        # Assign names based on column count to avoid KeyError
+        if data_array.shape[1] == 14:
+            raw_feature_names = ['age', 'gender', 'ESR', 'CRP', 'RF', 'antiCCP',
+                                 'HLA_B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA',
+                                 'antiSm', 'C3', 'C4']
+            df = pd.DataFrame(data_array, columns=raw_feature_names)
+        elif data_array.shape[1] == 22:
+            # Perturbation from LIME engine
+            df = pd.DataFrame(data_array, columns=FINAL_FEATURE_NAMES)
+        else:
+            raise ValueError(
+                f"Unexpected column count: {data_array.shape[1]}. Expected 14 (Streamlit form) or 22 columns (LIME examples).")
+
+    if df.isna().values.any():
+        df = knn_lime_imputer.transform(df)
+
+    # Recalculate engineered features (Ratios/Counts)
+    df['CRP_ESR_ratio'] = df['CRP'] / df['ESR']
+    df['RF_antiCCP_ratio'] = df['RF'] / df['antiCCP']
+    df['C3_C4_ratio'] = df['C3'] / df['C4']
+    df['ena_count'] = df['antiRo'] + df['antiLa'] + df['antiSm']
+    df['systemic_autoantibody_count'] = df['ANA'] + df['antiDsDNA'] + df['antiSm']
+    df['rf_antibody_score'] = df['RF'] * (df['antiCCP'] + 1)
+    df['spondyloarthropathy_risk'] = df['HLA_B27'] * df['age']
+
+    # Use clinical thresholds for status
+    df['inflammation_status'] = np.where(
+        (df['ESR'] > 20.0) | (df['CRP'] > 5.0), 1, 0
+    )
+
+    for column in ['gender', 'HLA_B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA', 'antiSm', 'inflammation_status']:
+        df[column] = df[column].astype(int)
+
+    # Reorder columns to match FINAL_FEATURE_NAMES exactly
+    df_lime = df[FINAL_FEATURE_NAMES].copy()
+
+    # Clean up any infinity values from division
+    df_lime = df_lime.mask(np.isinf(df_lime), 0)
+
+    return df_lime.values  # Returns the 22-feature unscaled array
 
 # Retrieving the autoimmune rheumatic disease class prediction
 def get_prediction(transformed_data):
@@ -296,9 +372,11 @@ def get_pil_image_from_matplotlib(figure):
 
 # Convert a Plotly figure to a PIL image
 def get_pil_image_from_plotly(figure):
-    image_bytes = figure.to_image(format="png")
-    return Image.open(BytesIO(image_bytes))
+    width = 1200
+    height = 1000
 
+    image_bytes = figure.to_image(format="png", width=width, height=height, scale=2)
+    return Image.open(BytesIO(image_bytes))
 
 def explain_graph_with_llm(is_plotly, figure, figure_context=None):
     if is_plotly:
@@ -454,8 +532,10 @@ def display_local_shap_interpretability(transformed_data, top_class_idx):
 
     # Get the index of the selected condition
     analysis_idx = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES.index(local_shap_selected_class_name)
+
     global top_disease
     top_disease = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES[top_class_idx]
+
     selected_disease = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES[analysis_idx]
 
     if analysis_idx == top_class_idx:
@@ -623,6 +703,126 @@ def display_local_shap_interpretability(transformed_data, top_class_idx):
         ):
             explain_graph_with_llm(False, waterfall_plot_figure, figure_context=figure_context)
 
+def lime_predict_proba(unscaled_numpy_array):
+    """
+    Wrapper for LIME to bridge unscaled perturbations and the scaled model.
+    """
+    # Convert LIME's numpy output back to a dictionary or DataFrame
+    # LIME sends a 2D array, so process row by row or as a batch
+    probabilities = []
+
+    for row in unscaled_numpy_array:
+        scaled_row = transform_lime_data(row)
+        probs = model.predict_proba(scaled_row.reshape(1, -1))
+        probabilities.append(probs[0])
+
+    return np.array(probabilities)
+
+def display_local_lime_interpretability(lime_data, top_class_idx):
+    st.divider()
+    st.subheader("Local Interpretable Model-agnostic Explanations (LIME)")
+
+    st.subheader("Differential Analysis")
+    st.warning(f":red-background[**Note**] LIME graphs are computationally expensive and may take a few seconds to load. Generated graphs are saved until a prediction for another patient is made.", icon=':material/search_activity:')
+    st.write("Select a condition to see why the machine learning model supported or discounted it specifically for this patient.")
+
+    # Default to the top prediction, but have an option for choosing other conditions
+    local_lime_selected_class_name = st.selectbox(
+        "View analysis for:",
+        options=AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES,
+        index=int(top_class_idx),
+        key='local_lime_disease_selectbox'
+    )
+
+    # Get the index of the selected condition
+    lime_analysis_idx = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES.index(local_lime_selected_class_name)
+
+    st.session_state["last_lime_analysis_idx"] = lime_analysis_idx
+
+    global top_lime_disease
+    top_lime_disease = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES[top_class_idx]
+    selected_lime_disease = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES[lime_analysis_idx]
+
+    if lime_analysis_idx == top_class_idx:
+        st.write(
+            f"The predicted condition, :yellow-background[{top_lime_disease}], is currently :green-background[**selected**].")
+    else:
+        st.write(
+            f"The predicted condition, :yellow-background[{top_lime_disease}], is currently :red-background[***not selected***].")
+
+    cache_lime_explainer_key = f"lime_explainer_{lime_analysis_idx}"
+    cache_key = f"lime_figure_{lime_analysis_idx}"
+    cache_figure_context_key = f"lime_figure_context_{lime_analysis_idx}"
+
+    if cache_key not in st.session_state:
+        with st.spinner(f"Generating LIME graph for the {selected_lime_disease} condition, please wait..."):
+            # Initialise LIME explainer (Uses Unscaled Training Data)
+            lime_explanation = lime_explainer.explain_instance(
+                data_row=lime_data.flatten(),
+                predict_fn=lime_predict_proba,
+                num_features=22,
+                labels=[lime_analysis_idx],
+                num_samples=2000
+            )
+
+            # Extract the list of (feature_description, weight) for the predicted class
+            # lime_explanation.as_list() returns tuples such as ('CRP > 5.0', 0.15)
+            lime_list = lime_explanation.as_list(label=lime_analysis_idx)
+
+            # Create a DataFrame for the Plotly graph
+            lime_df = pd.DataFrame(lime_list, columns=['Feature', 'Weight'])
+
+            # Decide title based on selected disease for analysis
+            if lime_analysis_idx == top_class_idx:
+                title = f"LIME Explanation: Why the Model Predicted Towards the {selected_lime_disease} Condition"
+                figure_context = f"A local LimeTabularExplainer explain instance bar graph, showing the features driving the prediction for {selected_lime_disease}."
+            else:
+                title = f"LIME Explanation: Why the Model Predicted Away from the {selected_lime_disease} Condition"
+                figure_context = f"A local LimeTabularExplainer explain instance bar graph, showing the features driving away the prediction for {selected_lime_disease}."
+
+            # Generate the Plotly horizontal bar chart
+            lime_figure = px.bar(
+                lime_df,
+                x='Weight',
+                y='Feature',
+                orientation='h',
+                color=lime_df['Weight'] > 0,
+                color_discrete_map={True: '#636efa', False: '#ef553b'}, # Blue colour for positive contribution, red colour for negative contribution
+                title=title
+            )
+
+            lime_figure.update_layout(
+                showlegend=False,
+                yaxis={'categoryorder': 'total ascending'},
+                xaxis_title="Influence on Prediction",
+                template="plotly_white"
+            )
+
+            # Store Plotly figure in session state
+            st.session_state[cache_lime_explainer_key] = lime_explanation
+            st.session_state[cache_key] = lime_figure
+            st.session_state[cache_figure_context_key] = figure_context
+
+            st.session_state["last_lime_explanation"] = lime_explanation
+            st.session_state["last_lime_analysis_idx"] = lime_analysis_idx
+
+    # Display the chart in Streamlit
+    lime_figure = st.session_state[cache_key]
+    st.plotly_chart(lime_figure, use_container_width=True)
+
+    figure_context = st.session_state[cache_figure_context_key]
+
+    # Explain LIME graph button
+    if st.button(
+            label="Explain this graph for me",
+            key='local_lime_explainer_button',
+            help='Use the LLM Clinical Assistant to explain the Local LIME Bar Plot',
+            type='primary',
+            icon=':material/chat_add_on:',
+            width='stretch'
+    ):
+        explain_graph_with_llm(True, lime_figure, figure_context=figure_context)
+
 def prepare_shap_summary_for_gemini(current_patient_shap_1d, feature_names):
     # Create a DataFrame to sort impacts
     df = pd.DataFrame({'Feature': feature_names, 'Impact': current_patient_shap_1d})
@@ -633,6 +833,22 @@ def prepare_shap_summary_for_gemini(current_patient_shap_1d, feature_names):
     for _, row in top_drivers.iterrows():
         direction = "Positive (Supporting)" if row['Impact'] > 0 else "Negative (Opposing)"
         summary += f"- {row['Feature']}: {direction} SHAP impact of {row['Impact']:.4f}\n"
+    return summary
+
+def prepare_lime_summary_for_gemini(lime_explanation, label_idx):
+    """
+    Extracts the feature descriptions and weights from LIME to provide textual context to the Gemini LLM.
+    """
+    # Extract the list of (feature_description, weight)
+    lime_list = lime_explanation.as_list(label=label_idx)
+
+    summary = "LIME Clinical Breakdown:\n"
+    for feature_description, weight in lime_list:
+        # Clean the mu symbol if it exists in the raw strings
+        clean_description = feature_description.replace('\u03bc', 'value')
+        direction = "Supporting" if weight > 0 else "Opposing"
+        summary += f"- {clean_description}: {direction} impact (Weight: {weight:.4f})\n"
+
     return summary
 
 def run_chatbot_interface(predicted_disease, probabilities, feature_names, current_shap_1d, explainer_image=None, figure_context=None):
@@ -700,20 +916,6 @@ def run_chatbot_interface(predicted_disease, probabilities, feature_names, curre
                         # Refresh the chatbot page
                         st.rerun()
 
-
-
-
-
-                # # Reset all messages currently in the session state (wiping visual messages)
-                # st.session_state.messages = []
-                #
-                # # Reset all chat history from the Gemini chat session (wiping Gemini's AI context)
-                # if "chat_session" in st.session_state:
-                #     del st.session_state.chat_session
-                #
-                # # Restart the chatbot clinical assistant for changes to take effect
-                # st.rerun()
-
         st.success(f":violet-background[**Context**] Currently analysing the diagnosis of ***{predicted_disease}*** in the patient", icon=':material/search_activity:')
         # st.info(f":orange-background[**Instructions**] Use the LLM to query about what the SHAP values obtained means, how the SHAP values explain influences in patient features that led to this prediction, and more.", icon=':material/chat_info:')
         st.warning(f":red-background[**Note**] The responses generated from this chat are produced by generative artificial intelligence (GenAI). Please take due diligence in validating the information generated against verified medical knowledge.", icon=':material/exclamation:')
@@ -732,16 +934,41 @@ def run_chatbot_interface(predicted_disease, probabilities, feature_names, curre
                 history.append({"role": role, "parts": [{"text": message["content"]}]})
 
             st.session_state.chat_session = gemini.chats.create(
-                model="gemini-2.5-flash-lite",
+                model="gemini-3-flash-preview",
                 config=GenerateContentConfig(
                     system_instruction=[
                         "You are an AI for an autoimmune rheumatology disease diagnosis machine learning model, as part of a clinical decision support system.",
                         "The possible conditions to be classified in the model are either: Ankylosing Spondylitis, Normal, Psoriatic Arthritis, Reactive Arthritis, Rheumatoid Arthritis, Sjögren\'s Syndrome, or Systemic Lupus Erythematosus.",
+                        """
+                        Some of the features of the model are feature-engineered models. The definition of the engineered features (for your understanding and responses in answers) are:
+                        dataset['CRP_ESR_ratio'] = dataset['CRP'] / dataset['ESR']
+                        dataset['RF_antiCCP_ratio'] = dataset['RF'] / dataset['antiCCP']
+                        dataset['C3_C4_ratio'] = dataset['C3'] / dataset['C4']
+                        
+                        dataset['ena_count'] = dataset['antiRo'] + dataset['antiLa'] + dataset['antiSm']
+                        dataset['systemic_autoantibody_count'] = dataset['ANA'] + dataset['antiDsDNA'] + dataset['antiSm']
+                        dataset['rf_antibody_score'] = dataset['RF'] * (dataset['antiCCP'] + 1)
+                        
+                        if dataset is [X_train_balanced, X_test_balanced]:
+                            dataset['inflammation_status'] = np.where(
+                                (dataset['ESR'] > Z_ESR_threshold) | (dataset['CRP'] > Z_CRP_threshold),
+                                1, # Value to put if True
+                                0  # Value to put if False
+                            )
+                        else:
+                            dataset['inflammation_status'] = np.where(
+                                (dataset['ESR'] > ESR_clinical_threshold) | (dataset['CRP'] > CRP_clinical_threshold),
+                                1, # Value to put if True
+                                0  # Value to put if False
+                            )
+
+                        dataset['spondyloarthropathy_risk'] = dataset['HLA_B27'] * dataset['age']
+                        """,
                         "Usually, the initial prompt the user sends will be of the predicted autoimmune rheumatic disease, with its confidence in %.",
                         "The prediction model uses a machine learning model with global and local SHAP graphs to add to the explainability factor of the prediction.",
-                        "A summary of the key local SHAP drivers of the prediction is typically also sent in a user's initial prompt.",
-                        "As the computer-science-to-natural-language translation layer, you will be the one to translate the SHAP graphs (that are difficult to interpret by clinicians and others) into natural-language terms that they can understand.",
-                        "Answer briefly and be clinically accurate as much as possible. It is essential that you maximise interpretability of the prediction and explainability graphs to support the clinician.",
+                        "A summary of the key local SHAP drivers and local LIME clinical threshold context of the prediction is typically also sent in a user's initial prompt.",
+                        "As the computer-science-to-natural-language translation layer, you will be the one to translate the SHAP and LIME graphs (that are difficult to interpret by clinicians and others) into natural-language terms that they can understand.",
+                        "Answer briefly and be clinically accurate as much as possible. It is essential that you maximise interpretability of the prediction and explainability graphs to support the clinician and their further decisions/actions to take for the patient.",
                         "Refer to specific lab values when possible."
                     ]
                 ),
@@ -758,7 +985,7 @@ def run_chatbot_interface(predicted_disease, probabilities, feature_names, curre
                             st.image(image)             # Display the image
 
         # React to user input
-        prompt = st.chat_input(placeholder="Ask about this diagnosis...",
+        prompt = st.chat_input(placeholder="Ask about this diagnosis prediction...",
                                 accept_file="multiple",
                                 file_type=["jpg", "jpeg", "png"])
 
@@ -799,22 +1026,29 @@ def run_chatbot_interface(predicted_disease, probabilities, feature_names, curre
 
                 # Prepare multimodal message parts for Gemini
                 # Prepare SHAP data for Gemini's context
-                summary_data = prepare_shap_summary_for_gemini(current_shap_1d, feature_names)
+                summary_shap_data = prepare_shap_summary_for_gemini(current_shap_1d, feature_names)
+
+                summary_lime_data = prepare_lime_summary_for_gemini(st.session_state["last_lime_explanation"], st.session_state["last_lime_analysis_idx"])
+
 
                 # Context about the figure from the "Explain this graph for me" button can be inserted here, if available
                 if figure_context is not None:
                     text_part = f"""
                                             Patient Prediction: {predicted_disease} ({max(probabilities) * 100:.2f}% confidence)
-                                            Key SHAP Drivers: {summary_data}
+                                            Key SHAP Drivers: {summary_shap_data}
+                                            Clinical Threshold Context: {summary_lime_data}
                                             Graph Context: {figure_context}
-                                            Explain this graph as if the user does not understand how to interpret a SHAP explainability graph from the diagnosis. Make it easy to understand.
+                                            Explain this graph as if the user does not understand how to interpret a SHAP and/or LIME explainability graph from the diagnosis. Make it easy to understand and in simple medical terms.
+                                            Use the LIME thresholds (example 'ESR <= 9.00') to explain the clinical reasoning, and SHAP to explain the relative importance.
                                         """
 
                 else:
                     text_part = f"""
                         Patient Prediction: {predicted_disease} ({max(probabilities) * 100:.2f}% confidence)
-                        Key SHAP Drivers: {summary_data}
+                        Key SHAP Drivers: {summary_shap_data}
+                        Clinical Threshold Context: {summary_lime_data}
                         User Question: {user_text}
+                        Use the LIME thresholds (example 'ESR <= 9.00') to explain the clinical reasoning, and SHAP to explain the relative importance.
                     """
 
                 # Flatten the text part to match Gemini's input requirements
@@ -922,6 +1156,12 @@ if 'messages' not in st.session_state:
 
 if submit:
     st.session_state.clicked = True
+
+    # Clear any existing LIME graph cache keys (this consideration is only done for LIME because it is computationally expensive unlike SHAP)
+    for key in list(st.session_state.keys()):
+        if key.startswith("lime_explainer_") or key.startswith("lime_figure_"):
+            del st.session_state[key]
+
     with st.spinner("Analysing patient's clinical data..."):
         try:
             # 1) Gather all inputs into a dictionary matching what transform_data() expects
@@ -959,7 +1199,9 @@ if submit:
             }
 
             # 2) Transform the raw input data
-            transformed_data, lime_data = transform_data(raw_input_data)
+            transformed_data, _ = transform_data(raw_input_data)
+
+            lime_data = transform_lime_data(raw_input_data)
 
             # 3) Calculate the autoimmune rheumatic disease class with the highest probability
             probabilities, top_class_idx = get_prediction(transformed_data)
@@ -969,9 +1211,11 @@ if submit:
 
             # 5) Store in session state for Gemini LLM usage later
             st.session_state.results = {
+                'raw_input_data': raw_input_data,
                 'probabilities': probabilities,
                 'top_class_idx': top_class_idx,
-                'transformed_data': transformed_data
+                'transformed_data': transformed_data,
+                'lime_data': lime_data
             }
 
         except Exception as e:
@@ -996,6 +1240,8 @@ if submit:
 
     display_local_shap_interpretability(transformed_data, top_class_idx)
 
+    display_local_lime_interpretability(lime_data, top_class_idx)
+
     st.session_state['last_prediction'] = {
         'predicted_disease': AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES[top_class_idx],
         'probabilities': probabilities,
@@ -1006,11 +1252,12 @@ if submit:
 
     prepare_shap_summary_for_gemini(current_patient_shap_1d, FINAL_FEATURE_NAMES)
 
+    prepare_lime_summary_for_gemini(st.session_state["last_lime_explanation"], st.session_state["last_lime_analysis_idx"])
+
     # run_chatbot_interface(top_disease, probabilities, FINAL_FEATURE_NAMES, current_patient_shap_1d)
 
 # If the website is refreshed, and a button has been clicked already
 elif st.session_state.clicked:
-
     # Retrieve the past result
     result = st.session_state.results
     last_prediction = st.session_state['last_prediction']
@@ -1018,6 +1265,7 @@ elif st.session_state.clicked:
     # Restore the result and plots
     display_results(result['probabilities'], result['top_class_idx'])
 
+    # Redisplay global SHAP insights
     display_global_interpretability(
         global_shap_values,
         global_shap_explanation,
@@ -1026,8 +1274,15 @@ elif st.session_state.clicked:
         result['top_class_idx']
     )
 
+    # Redisplay local SHAP insights
     display_local_shap_interpretability(
         result['transformed_data'],
+        result['top_class_idx']
+    )
+
+    # Redisplay local LIME insights
+    display_local_lime_interpretability(
+        result['lime_data'],
         result['top_class_idx']
     )
 
