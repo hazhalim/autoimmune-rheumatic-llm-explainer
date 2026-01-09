@@ -62,6 +62,10 @@ FINAL_FEATURE_NAMES = [
         'gender', 'HLA_B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA', 'antiSm', 'inflammation_status'
 ]
 
+# Global require imputation flag
+if 'requires_imputation' not in st.session_state:
+    st.session_state.requires_imputation = False
+
 # Functions
 # Loading files/models function
 @st.cache_resource
@@ -104,8 +108,9 @@ preprocessor_1, preprocessor_2, knn_imputer, model, explainer, X_sample, global_
 # Transforming input data function
 def transform_data(raw_input_data):
   """
-  Returns final scaled row and final row for LIME purposes.
+  Returns final scaled row.
   """
+
   # Convert raw data from dictionary form to DataFrame form
   loaded_row = pd.DataFrame([raw_input_data])
   imputed_row = pd.DataFrame()
@@ -133,6 +138,8 @@ def transform_data(raw_input_data):
 
   # torch.cuda_is_available() in place of False if GPU is available
   if scaled_row.isna().values.any() and False:
+    st.session_state.requires_imputation = True
+
     row = scaled_row.copy()
 
     # Drop the columns where values are missing
@@ -152,25 +159,30 @@ def transform_data(raw_input_data):
     # imputed_row = synthesizer.sample_from_conditions([imputation_condition])
 
   elif scaled_row.isna().values.any():
+    st.session_state.requires_imputation = True
+
     # If GPU is not available, we impute using KNNImputer
     # Define the binary (False/True, 0/1) columns
     binary_columns = ['HLA_B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA', 'antiSm']
 
     # Transform the row using KNNImputer
     imputed_row_array = knn_imputer.transform(scaled_row)
-    imputed_lime_row_array = knn_lime_imputer.transform(loaded_row)
+    # imputed_lime_row_array = knn_lime_imputer.transform(loaded_row)
 
     # Convert the imputed features back and its column names to a DataFrame (because imputer returns a NumPy array, not a DataFrame)
     imputed_row = pd.DataFrame(imputed_row_array, columns=scaled_row.columns)
-    imputed_lime_row = pd.DataFrame(imputed_lime_row_array, columns=scaled_row.columns)
+    # imputed_lime_row = pd.DataFrame(imputed_lime_row_array, columns=scaled_row.columns)
 
     # Round the values of the binary columns
     for column in binary_columns:
         imputed_row[column] = np.round(imputed_row[column])
         imputed_row[column] = imputed_row[column].astype(int)
 
-        imputed_lime_row[column] = np.round(imputed_lime_row[column])
-        imputed_lime_row[column] = imputed_lime_row[column].astype(int)
+  else:
+    st.session_state.requires_imputation = False
+
+        # imputed_lime_row[column] = np.round(imputed_lime_row[column])
+        # imputed_lime_row[column] = imputed_lime_row[column].astype(int)
 
   # FEATURE ENGINEERING
   # Get back the StandardScaler of the first feature scaling
@@ -198,7 +210,7 @@ def transform_data(raw_input_data):
   # Creating the features
   # lime_row = imputed_row.copy()
 
-  for row in [imputed_row, imputed_lime_row]:
+  for row in [imputed_row]:
     # Ratio of acute phase reactants
     row['CRP_ESR_ratio'] = row['CRP'] / row['ESR']
     row['RF_antiCCP_ratio'] = row['RF'] / row['antiCCP']
@@ -227,7 +239,7 @@ def transform_data(raw_input_data):
     row['spondyloarthropathy_risk'] = row['HLA_B27'] * row['age']
 
   imputed_row = imputed_row.mask(np.isinf(imputed_row), 0)
-  imputed_lime_row = imputed_lime_row.mask(np.isinf(imputed_lime_row), 0)
+  # imputed_lime_row = imputed_lime_row.mask(np.isinf(imputed_lime_row), 0)
 
   # RE-SCALING FEATURES
   # Features to scale (non-binary)
@@ -245,21 +257,23 @@ def transform_data(raw_input_data):
   # Scaled features first, then passthrough features (continuous + binary)
   final_scaled_row = pd.DataFrame(scaled_row_array_final, columns=new_column_order_final)
 
-  imputed_lime_row = imputed_lime_row[new_column_order_final]
+  # imputed_lime_row = imputed_lime_row[new_column_order_final]
 
   final_scaled_row_array = final_scaled_row.values
-  imputed_lime_row_array = imputed_lime_row.values
+  # imputed_lime_row_array = imputed_lime_row.values
 
-  return final_scaled_row_array, imputed_lime_row_array
+  return final_scaled_row_array, "no_longer_required"
 
 def transform_lime_data(raw_input_data):
     """
     Specifically for LIME: Transforms raw input into the 22-feature unscaled
     format required for the LIME graph labels.
     """
-    # Handle Dictionary Input (Streamlit Form - 14 features)
+    knn_imputer_column_format = knn_lime_imputer.feature_names_in_
+
+    # Handle dictionary input (Streamlit form with 14 features)
     if isinstance(raw_input_data, dict):
-        df = pd.DataFrame([raw_input_data])
+        df = pd.DataFrame([raw_input_data], columns=knn_imputer_column_format)
 
     # Handle NumPy Array Input (LIME - 22 features)
     else:
@@ -281,7 +295,9 @@ def transform_lime_data(raw_input_data):
                 f"Unexpected column count: {data_array.shape[1]}. Expected 14 (Streamlit form) or 22 columns (LIME examples).")
 
     if df.isna().values.any():
-        df = knn_lime_imputer.transform(df)
+        df_columns = df.columns
+        imputed_array = knn_lime_imputer.transform(df)
+        df = pd.DataFrame(imputed_array, columns=df_columns)
 
     # Recalculate engineered features (Ratios/Counts)
     df['CRP_ESR_ratio'] = df['CRP'] / df['ESR']
@@ -325,10 +341,15 @@ def display_results(probabilities, top_class_idx):
     """
     Renders the autoimmune rheumatic disease prediction results in the Streamlit UI.
     """
+
     predicted_disease = AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES[top_class_idx]
     confidence = probabilities[top_class_idx]
 
     st.header("Autoimmune Rheumatic Diagnostic Prediction Results")
+
+    # Imputation performed warning
+    if st.session_state.get('requires_imputation', True):
+        st.warning(f":red-background[**Note**] You have left at least one field blank in the form. The value for the blank field has been imputed accordingly, but it is best to fill in the value for the most accurate results.", icon=':material/exclamation:')
 
     # 1. Main callout
     col1, col2 = st.columns([2, 1])
@@ -1108,8 +1129,8 @@ with st.form("clinical_form"):
         gender = st.selectbox("Gender", options=[0, 1], format_func=lambda x: "Female" if x == 0 else "Male")
 
     with col2:
-        esr = st.number_input("Erythrocyte Sedimentation Rate (ESR, mm/hr)", min_value=0.0, max_value=150.0, value=15.0, help="Normal: Male < 15, Female < 20")
-        crp = st.number_input("C-Reactive Protein (CRP, mg/L)", min_value=0.0, max_value=300.0, value=3.0, help="Normal range: 0.1 to 3.0 mg/L")
+        esr = st.number_input("Erythrocyte Sedimentation Rate (ESR, mm/hr)", min_value=0.0, max_value=150.0, value=np.nan, help="Normal: Male < 15, Female < 20") # Previous default value: 15.0
+        crp = st.number_input("C-Reactive Protein (CRP, mg/L)", min_value=0.0, max_value=300.0, value=np.nan, help="Normal range: 0.1 to 3.0 mg/L") # Previous default value: 3.0
 
     st.divider()
 
@@ -1118,16 +1139,16 @@ with st.form("clinical_form"):
     col3, col4 = st.columns(2)
 
     with col3:
-        rf = st.number_input("Rheumatoid Factor (RF, IU/ml)", min_value=0.0, max_value=500.0, value=10.0, help="Normal range: 0.1 to 3.0 IU/ml")
-        anti_ccp = st.number_input("Anti-Cyclic Citrullinated Peptide (anti-CCP, U/mL)", min_value=0.0, max_value=500.0, value=10.0, help="Normal range: 0.0 - 20.0 U/mL")
-        hla_b27 = st.selectbox("Human Leukocyte Antigen B27 (HLA-B27)", options=[0, 1], format_func=lambda x: "Negative" if x == 0 else "Positive")
-        ana = st.selectbox("Anti-Nuclear Antibody (ANA)", options=[0, 1], format_func=lambda x: "Negative" if x == 0 else "Positive")
+        rf = st.number_input("Rheumatoid Factor (RF, IU/ml)", min_value=0.0, max_value=500.0, value=np.nan, help="Normal range: 0.1 to 3.0 IU/ml") # Previous default value: 10.0
+        anti_ccp = st.number_input("Anti-Cyclic Citrullinated Peptide (anti-CCP, U/mL)", min_value=0.0, max_value=500.0, value=np.nan, help="Normal range: 0.0 to 20.0 U/mL") # Previous default value: 10.0
+        hla_b27 = st.selectbox("Human Leukocyte Antigen B27 (HLA-B27)", options=[np.nan, 0, 1], format_func=lambda x: "Select option..." if x is np.nan else ("Negative" if x == 0 else "Positive"), help="Choose \"Select option...\" if not tested")
+        ana = st.selectbox("Anti-Nuclear Antibody (ANA)", options=[np.nan, 0, 1], format_func=lambda x: "Select option..." if x is np.nan else ("Negative" if x == 0 else "Positive"), help="Choose \"Select option...\" if not tested")
 
     with col4:
-        anti_ro = st.selectbox("Anti-Ro/SSA Antibodies", options=[0, 1], format_func=lambda x: "Negative" if x == 0 else "Positive")
-        anti_la = st.selectbox("Anti-La/SSB Antibodies", options=[0, 1], format_func=lambda x: "Negative" if x == 0 else "Positive")
-        anti_dsdna = st.selectbox("Anti-double stranded DNA Antibodies (anti-dsDNA)", options=[0, 1], format_func=lambda x: "Negative" if x == 0 else "Positive")
-        anti_sm = st.selectbox("Anti-Smith Antibodies (anti-Sm)", options=[0, 1], format_func=lambda x: "Negative" if x == 0 else "Positive")
+        anti_ro = st.selectbox("Anti-Ro/SSA Antibodies", options=[np.nan, 0, 1], format_func=lambda x: "Select option..." if x is np.nan else ("Negative" if x == 0 else "Positive"), help="Choose \"Select option...\" if not tested")
+        anti_la = st.selectbox("Anti-La/SSB Antibodies", options=[np.nan, 0, 1], format_func=lambda x: "Select option..." if x is np.nan else ("Negative" if x == 0 else "Positive"), help="Choose \"Select option...\" if not tested")
+        anti_dsdna = st.selectbox("Anti-double stranded DNA Antibodies (anti-dsDNA)", options=[np.nan, 0, 1], format_func=lambda x: "Select option..." if x is np.nan else ("Negative" if x == 0 else "Positive"), help="Choose \"Select option...\" if not tested")
+        anti_sm = st.selectbox("Anti-Smith Antibodies (anti-Sm)", options=[np.nan, 0, 1], format_func=lambda x: "Select option..." if x is np.nan else ("Negative" if x == 0 else "Positive"), help="Choose \"Select option...\" if not tested")
 
     st.divider()
 
@@ -1136,15 +1157,13 @@ with st.form("clinical_form"):
     col5, col6 = st.columns(2)
 
     with col5:
-        c3 = st.number_input("Complement Component 3 (C3, mg/dL)", min_value=0.0, max_value=300.0, value=120.0,
-                             help="Normal ranges: Male 90 to 180 mg/dL, Female 88 to 206 mg/dL")
+        c3 = st.number_input("Complement Component 3 (C3, mg/dL)", min_value=0.0, max_value=300.0, value=np.nan, help="Normal ranges: Male 90 to 180 mg/dL, Female 88 to 206 mg/dL") # Previous default value = 120.0
 
     with col6:
-        c4 = st.number_input("Complement Component 4 (C4, mg/dL)", min_value=0.0, max_value=150.0, value=30.0,
-                             help="Normal ranges: Male 12 to 72 mg/dL, Female 13 to 75 mg/dL")
+        c4 = st.number_input("Complement Component 4 (C4, mg/dL)", min_value=0.0, max_value=150.0, value=np.nan, help="Normal ranges: Male 12 to 72 mg/dL, Female 13 to 75 mg/dL") # Previous default value = 30.0
 
     st.write("")  # Spacing
-    submit = st.form_submit_button("Run Autoimmune Rheumatic Diagnostic Analysis")
+    submit = st.form_submit_button("Run Autoimmune Rheumatic Diagnostic Analysis", type='primary', icon=':material/upload_file:', width='stretch')
 
 # Processing the input once the Submit button has been clicked
 # Initialise the clicked state and LLM messages if it has not existed yet
