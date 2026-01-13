@@ -9,9 +9,11 @@ import pandas as pd
 import numpy as np
 import traceback
 import sys
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder
 
 # SHAP and LIME imports
-import plotly
+# import plotly
 import plotly.express as px
 import matplotlib.pyplot as plt
 import shap
@@ -56,10 +58,7 @@ AUTOIMMUNE_RHEUMATIC_DISEASE_MAPPING = {
 
 FINAL_FEATURE_NAMES = [
         'age', 'ESR', 'CRP', 'RF', 'antiCCP', 'C3', 'C4',
-        'CRP_ESR_ratio', 'RF_antiCCP_ratio', 'C3_C4_ratio',
-        'ena_count', 'systemic_autoantibody_count',
-        'rf_antibody_score', 'spondyloarthropathy_risk',
-        'gender', 'HLA_B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA', 'antiSm', 'inflammation_status'
+        'gender', 'HLA-B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA', 'antiSm'
 ]
 
 # Global require imputation flag
@@ -70,19 +69,23 @@ if 'requires_imputation' not in st.session_state:
 # Loading files/models function
 @st.cache_resource
 def load_resources():
-    p1 = joblib.load('preprocessor_1.joblib')
-    p2 = joblib.load('preprocessor_2.joblib')
-    knn = joblib.load('knn_imputer.joblib')
+    numerical_imputer = joblib.load('numerical_imputer.joblib')
+    categorical_imputer = joblib.load('categorical_imputer.joblib')
+    ohe = joblib.load('one_hot_encoder.joblib')
+
+    # p1 = joblib.load('preprocessor_1.joblib')
+    # p2 = joblib.load('preprocessor_2.joblib')
+    # knn = joblib.load('knn_imputer.joblib')
 
     # Not using this anymore
     # synthesizer = load_synthesizer('autoimmune_rheumatic_diagnosis_synthesizer_27-12-2025-18-18.pkl')
 
-    cbc = joblib.load('cbc_model.joblib')
+    lgbmc = joblib.load('best_lgbmc_model.joblib')
 
     # Initialise the SHAP TreeExplainer
-    explainer = shap.TreeExplainer(cbc)
+    explainer = shap.TreeExplainer(lgbmc)
 
-    X_sample = shap.sample(joblib.load('X_train_scaled_final.joblib'), 1000)
+    X_sample = shap.sample(joblib.load('X_train_balanced_final.joblib'), 1000)
 
     # Calculate global SHAP values
     global_shap_values = explainer.shap_values(X_sample)
@@ -94,16 +97,16 @@ def load_resources():
     gemini = genai.Client(api_key=GEMINI_API_KEY)
 
     # Load the LIME explainer using dill
-    with open('lime_explainer_final.pkl', 'rb') as file:
+    with open('latest_lime_explainer_final.pkl', 'rb') as file:
         lime_explainer = dill.load(file)
 
     # KNN imputer for LIME
-    knn_lime = joblib.load('knn_lime_imputer.joblib')
+    # knn_lime = joblib.load('knn_lime_imputer.joblib')
 
-    return p1, p2, knn, cbc, explainer, X_sample, global_shap_values, global_shap_explanation, GEMINI_API_KEY, gemini, lime_explainer, knn_lime
+    return numerical_imputer, categorical_imputer, ohe, lgbmc, explainer, X_sample, global_shap_values, global_shap_explanation, GEMINI_API_KEY, gemini, lime_explainer
 
 # Immediately load the models
-preprocessor_1, preprocessor_2, knn_imputer, model, explainer, X_sample, global_shap_values, global_shap_explanation, GEMINI_API_KEY, gemini, lime_explainer, knn_lime_imputer = load_resources()
+numerical_imputer, categorical_imputer, ohe, model, explainer, X_sample, global_shap_values, global_shap_explanation, GEMINI_API_KEY, gemini, lime_explainer = load_resources()
 
 # Transforming input data function
 def transform_data(raw_input_data):
@@ -116,37 +119,35 @@ def transform_data(raw_input_data):
   imputed_row = pd.DataFrame()
 
   # FEATURE SCALING
-  # Features to scale (non-binary)
-  continuous_features = ['age', 'ESR', 'CRP', 'RF', 'antiCCP', 'C3', 'C4']
-
-  # Get binary features
-  binary_features = loaded_row.columns.drop(continuous_features).tolist()
-
-  # Transform the data
-  scaled_row_array = preprocessor_1.transform(loaded_row)
-
-  new_column_order = continuous_features + binary_features
-
-  scaled_row = pd.DataFrame(scaled_row_array, columns=new_column_order)
+  # # Features to scale (non-binary)
+  # continuous_features = ['age', 'ESR', 'CRP', 'RF', 'antiCCP', 'C3', 'C4']
+  #
+  # # Get binary features
+  # binary_features = loaded_row.columns.drop(continuous_features).tolist()
+  #
+  # # Transform the data
+  # scaled_row_array = preprocessor_1.transform(loaded_row)
+  #
+  # new_column_order = continuous_features + binary_features
+  #
+  # scaled_row = pd.DataFrame(scaled_row_array, columns=new_column_order)
 
   # IMPUTING MISSING VALUES
-  # Check for any missing values, if there is, impute by CTGANSynthesizer with conditions if GPU is enabled, else use KNNImputer
-  imputed_row = scaled_row.copy()
-
-  # Create imputed lime row here earlier in case there are no missing values
-  imputed_lime_row = loaded_row[new_column_order].copy()
+  # Create imputed row here earlier in case there are no missing values
+  imputed_row = loaded_row.copy()
 
   # torch.cuda_is_available() in place of False if GPU is available
-  if scaled_row.isna().values.any() and False:
-    st.session_state.requires_imputation = True
-
-    row = scaled_row.copy()
-
-    # Drop the columns where values are missing
-    known_features = row.dropna()
+  if imputed_row.isna().values.any() and False:
+    imputed_row = imputed_row
+    # st.session_state.requires_imputation = True
+    #
+    # row = imputed_row.copy()
+    #
+    # # Drop the columns where values are missing
+    # known_features = row.dropna()
 
     # Export the values
-    known_features_dict = known_features.to_dict()
+    # known_features_dict = known_features.to_dict()
 
     # Create the sampling condition
     # imputation_condition = Condition(
@@ -158,171 +159,196 @@ def transform_data(raw_input_data):
     # Uncomment line below when using GPU
     # imputed_row = synthesizer.sample_from_conditions([imputation_condition])
 
-  elif scaled_row.isna().values.any():
+  elif imputed_row.isna().values.any():
     st.session_state.requires_imputation = True
 
-    # If GPU is not available, we impute using KNNImputer
-    # Define the binary (False/True, 0/1) columns
-    binary_columns = ['HLA_B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA', 'antiSm']
+    # Impute using the numerical (mean) and categorical (mode) imputer
+    # Define the categorical and numerical columns
+    numerical_columns = ['age', 'ESR', 'CRP', 'RF', 'antiCCP', 'C3', 'C4']
+    categorical_columns = ['gender', 'HLA-B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA', 'antiSm']
 
-    # Transform the row using KNNImputer
-    imputed_row_array = knn_imputer.transform(scaled_row)
+    # Transform the row using numerical and categorical imputers (mean and mode)
+    imputed_row[numerical_columns] = numerical_imputer.transform(imputed_row[numerical_columns])
+    imputed_row[categorical_columns] = categorical_imputer.transform(imputed_row[categorical_columns])
+
+    # Create a mapping dictionary
+    mapping = {"Negative": 0, "Positive": 1}
+
+    # Apply to the categorical columns
+    for column in categorical_columns:
+        imputed_row[column] = imputed_row[column].replace(mapping)
+
+    # raise ValueError(imputed_row[categorical_columns])
+
+    # Use One-Hot Encoding for encoding categorical features
+    # imputed_row_encoded_array = ohe.transform(imputed_row[categorical_columns])
+    # imputed_row_encoded = pd.DataFrame(imputed_row_encoded_array, columns=ohe.get_feature_names_out(categorical_columns))
+
+    # Reset the encoded column names into its original column names
+    # imputed_row_encoded.columns = [column.split('_')[0] for column in imputed_row_encoded.columns]
+
+    # Concatenate the encoded categorical columns back with the numerical columns
+    # concatenated_row = pd.concat([imputed_row[numerical_columns].reset_index(drop=True), imputed_row_encoded.reset_index(drop=True)], axis=1)
+    concatenated_row = imputed_row.copy()
+
+
     # imputed_lime_row_array = knn_lime_imputer.transform(loaded_row)
 
     # Convert the imputed features back and its column names to a DataFrame (because imputer returns a NumPy array, not a DataFrame)
-    imputed_row = pd.DataFrame(imputed_row_array, columns=scaled_row.columns)
+    # imputed_row = pd.DataFrame(imputed_row_array, columns=scaled_row.columns)
     # imputed_lime_row = pd.DataFrame(imputed_lime_row_array, columns=scaled_row.columns)
 
     # Round the values of the binary columns
-    for column in binary_columns:
-        imputed_row[column] = np.round(imputed_row[column])
-        imputed_row[column] = imputed_row[column].astype(int)
+    # for column in binary_columns:
+    #     imputed_row[column] = np.round(imputed_row[column])
+    #     imputed_row[column] = imputed_row[column].astype(int)
 
   else:
     st.session_state.requires_imputation = False
+    concatenated_row = imputed_row.copy()
 
         # imputed_lime_row[column] = np.round(imputed_lime_row[column])
         # imputed_lime_row[column] = imputed_lime_row[column].astype(int)
 
   # FEATURE ENGINEERING
   # Get back the StandardScaler of the first feature scaling
-  initial_scaler = preprocessor_1.named_transformers_['cont_scaler']
+  # initial_scaler = preprocessor_1.named_transformers_['cont_scaler']
 
   # Get the indices for ESR and CRP
-  ESR_index = 1
-  CRP_index = 2
+  # ESR_index = 1
+  # CRP_index = 2
 
   # Get ESR and CRP's mean and scale
-  ESR_mean = initial_scaler.mean_[ESR_index]
-  ESR_scale = initial_scaler.scale_[ESR_index]
-
-  CRP_mean = initial_scaler.mean_[CRP_index]
-  CRP_scale = initial_scaler.scale_[CRP_index]
+  # ESR_mean = initial_scaler.mean_[ESR_index]
+  # ESR_scale = initial_scaler.scale_[ESR_index]
+  #
+  # CRP_mean = initial_scaler.mean_[CRP_index]
+  # CRP_scale = initial_scaler.scale_[CRP_index]
 
   # Clinical thresholds for inflammation status
-  ESR_clinical_threshold = 20.0
-  CRP_clinical_threshold = 5.0
+  # ESR_clinical_threshold = 20.0
+  # CRP_clinical_threshold = 5.0
 
   # Calculating the Z-score of the threshold (because ESR and CRP in balanced DFs are already scaled)
-  Z_ESR_threshold = (ESR_clinical_threshold - ESR_mean) / ESR_scale
-  Z_CRP_threshold = (CRP_clinical_threshold - CRP_mean) / CRP_scale
+  # Z_ESR_threshold = (ESR_clinical_threshold - ESR_mean) / ESR_scale
+  # Z_CRP_threshold = (CRP_clinical_threshold - CRP_mean) / CRP_scale
 
   # Creating the features
   # lime_row = imputed_row.copy()
 
-  for row in [imputed_row]:
-    # Ratio of acute phase reactants
-    row['CRP_ESR_ratio'] = row['CRP'] / row['ESR']
-    row['RF_antiCCP_ratio'] = row['RF'] / row['antiCCP']
-    row['C3_C4_ratio'] = row['C3'] / row['C4']
+  # for row in [imputed_row]:
+  #   # Ratio of acute phase reactants
+  #   row['CRP_ESR_ratio'] = row['CRP'] / row['ESR']
+  #   row['RF_antiCCP_ratio'] = row['RF'] / row['antiCCP']
+  #   row['C3_C4_ratio'] = row['C3'] / row['C4']
+  #
+  #   # Immunological activity scores
+  #   # Extractable Nuclear Antigen (ENA) Count
+  #   row['ena_count'] = row['antiRo'] + row['antiLa'] + row['antiSm']
+  #   row['systemic_autoantibody_count'] = row['ANA'] + row['antiDsDNA'] + row['antiSm']
+  #   row['rf_antibody_score'] = row['RF'] * (row['antiCCP'] + 1)
+  #
+  #   # Interaction and status features
+  #   if row is imputed_row:
+  #     row['inflammation_status'] = np.where(
+  #       (row['ESR'] > Z_ESR_threshold) | (row['CRP'] > Z_CRP_threshold),
+  #       1, # Value to put if True
+  #       0  # Value to put if False
+  #     )
+  #   else:
+  #     row['inflammation_status'] = np.where(
+  #       (row['ESR'] > ESR_clinical_threshold) | (row['CRP'] > CRP_clinical_threshold),
+  #       1, # Value to put if True
+  #       0  # Value to put if False
+  #     )
+  #
+  #   row['spondyloarthropathy_risk'] = row['HLA_B27'] * row['age']
 
-    # Immunological activity scores
-    # Extractable Nuclear Antigen (ENA) Count
-    row['ena_count'] = row['antiRo'] + row['antiLa'] + row['antiSm']
-    row['systemic_autoantibody_count'] = row['ANA'] + row['antiDsDNA'] + row['antiSm']
-    row['rf_antibody_score'] = row['RF'] * (row['antiCCP'] + 1)
-
-    # Interaction and status features
-    if row is imputed_row:
-      row['inflammation_status'] = np.where(
-        (row['ESR'] > Z_ESR_threshold) | (row['CRP'] > Z_CRP_threshold),
-        1, # Value to put if True
-        0  # Value to put if False
-      )
-    else:
-      row['inflammation_status'] = np.where(
-        (row['ESR'] > ESR_clinical_threshold) | (row['CRP'] > CRP_clinical_threshold),
-        1, # Value to put if True
-        0  # Value to put if False
-      )
-
-    row['spondyloarthropathy_risk'] = row['HLA_B27'] * row['age']
-
-  imputed_row = imputed_row.mask(np.isinf(imputed_row), 0)
+  # imputed_row = imputed_row.mask(np.isinf(imputed_row), 0)
   # imputed_lime_row = imputed_lime_row.mask(np.isinf(imputed_lime_row), 0)
 
   # RE-SCALING FEATURES
   # Features to scale (non-binary)
-  final_continuous_features = ['age', 'ESR', 'CRP', 'RF', 'antiCCP', 'C3', 'C4', 'CRP_ESR_ratio', 'RF_antiCCP_ratio', 'C3_C4_ratio', 'ena_count', 'systemic_autoantibody_count', 'rf_antibody_score', 'spondyloarthropathy_risk']
+  # final_continuous_features = ['age', 'ESR', 'CRP', 'RF', 'antiCCP', 'C3', 'C4', 'CRP_ESR_ratio', 'RF_antiCCP_ratio', 'C3_C4_ratio', 'ena_count', 'systemic_autoantibody_count', 'rf_antibody_score', 'spondyloarthropathy_risk']
 
   # Get binary features
-  final_binary_features = imputed_row.columns.drop(final_continuous_features).tolist()
+  # final_binary_features = imputed_row.columns.drop(final_continuous_features).tolist()
 
-  new_column_order_final = final_continuous_features + final_binary_features
+  # new_column_order_final = final_continuous_features + final_binary_features
 
   # imputed_row = imputed_row[new_column_order_final]
-  scaled_row_array_final = preprocessor_2.transform(imputed_row)
+  # scaled_row_array_final = preprocessor_2.transform(imputed_row)
 
   # Reassemble the DataFrame
   # Scaled features first, then passthrough features (continuous + binary)
-  final_scaled_row = pd.DataFrame(scaled_row_array_final, columns=new_column_order_final)
+  # final_scaled_row = pd.DataFrame(scaled_row_array_final, columns=new_column_order_final)
 
   # imputed_lime_row = imputed_lime_row[new_column_order_final]
 
-  final_scaled_row_array = final_scaled_row.values
+  # final_scaled_row_array = final_scaled_row.values
   # imputed_lime_row_array = imputed_lime_row.values
 
-  return final_scaled_row_array, "no_longer_required"
+  return concatenated_row, "no_longer_required"
 
-def transform_lime_data(raw_input_data):
-    """
-    Specifically for LIME: Transforms raw input into the 22-feature unscaled
-    format required for the LIME graph labels.
-    """
-    knn_imputer_column_format = knn_lime_imputer.feature_names_in_
-
-    # Handle dictionary input (Streamlit form with 14 features)
-    if isinstance(raw_input_data, dict):
-        df = pd.DataFrame([raw_input_data], columns=knn_imputer_column_format)
-
-    # Handle NumPy Array Input (LIME - 22 features)
-    else:
-        data_array = np.array(raw_input_data)
-        if data_array.ndim == 1:
-            data_array = data_array.reshape(1, -1)
-
-        # Assign names based on column count to avoid KeyError
-        if data_array.shape[1] == 14:
-            raw_feature_names = ['age', 'gender', 'ESR', 'CRP', 'RF', 'antiCCP',
-                                 'HLA_B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA',
-                                 'antiSm', 'C3', 'C4']
-            df = pd.DataFrame(data_array, columns=raw_feature_names)
-        elif data_array.shape[1] == 22:
-            # Perturbation from LIME engine
-            df = pd.DataFrame(data_array, columns=FINAL_FEATURE_NAMES)
-        else:
-            raise ValueError(
-                f"Unexpected column count: {data_array.shape[1]}. Expected 14 (Streamlit form) or 22 columns (LIME examples).")
-
-    if df.isna().values.any():
-        df_columns = df.columns
-        imputed_array = knn_lime_imputer.transform(df)
-        df = pd.DataFrame(imputed_array, columns=df_columns)
-
-    # Recalculate engineered features (Ratios/Counts)
-    df['CRP_ESR_ratio'] = df['CRP'] / df['ESR']
-    df['RF_antiCCP_ratio'] = df['RF'] / df['antiCCP']
-    df['C3_C4_ratio'] = df['C3'] / df['C4']
-    df['ena_count'] = df['antiRo'] + df['antiLa'] + df['antiSm']
-    df['systemic_autoantibody_count'] = df['ANA'] + df['antiDsDNA'] + df['antiSm']
-    df['rf_antibody_score'] = df['RF'] * (df['antiCCP'] + 1)
-    df['spondyloarthropathy_risk'] = df['HLA_B27'] * df['age']
-
-    # Use clinical thresholds for status
-    df['inflammation_status'] = np.where(
-        (df['ESR'] > 20.0) | (df['CRP'] > 5.0), 1, 0
-    )
-
-    for column in ['gender', 'HLA_B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA', 'antiSm', 'inflammation_status']:
-        df[column] = df[column].astype(int)
-
-    # Reorder columns to match FINAL_FEATURE_NAMES exactly
-    df_lime = df[FINAL_FEATURE_NAMES].copy()
-
-    # Clean up any infinity values from division
-    df_lime = df_lime.mask(np.isinf(df_lime), 0)
-
-    return df_lime.values  # Returns the 22-feature unscaled array
+# def transform_lime_data(raw_input_data):
+#     """
+#     Specifically for LIME: Transforms raw input into the 22-feature unscaled
+#     format required for the LIME graph labels.
+#     """
+#     # knn_imputer_column_format = knn_lime_imputer.feature_names_in_
+#
+#     # Handle dictionary input (Streamlit form with 14 features)
+#     if isinstance(raw_input_data, dict):
+#         df = pd.DataFrame([raw_input_data], columns=knn_imputer_column_format)
+#
+#     # Handle NumPy Array Input (LIME - 22 features)
+#     else:
+#         data_array = np.array(raw_input_data)
+#         if data_array.ndim == 1:
+#             data_array = data_array.reshape(1, -1)
+#
+#         # Assign names based on column count to avoid KeyError
+#         if data_array.shape[1] == 14:
+#             raw_feature_names = ['age', 'gender', 'ESR', 'CRP', 'RF', 'antiCCP',
+#                                  'HLA_B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA',
+#                                  'antiSm', 'C3', 'C4']
+#             df = pd.DataFrame(data_array, columns=raw_feature_names)
+#         elif data_array.shape[1] == 22:
+#             # Perturbation from LIME engine
+#             df = pd.DataFrame(data_array, columns=FINAL_FEATURE_NAMES)
+#         else:
+#             raise ValueError(
+#                 f"Unexpected column count: {data_array.shape[1]}. Expected 14 (Streamlit form) or 22 columns (LIME examples).")
+#
+#     if df.isna().values.any():
+#         df_columns = df.columns
+#         imputed_array = knn_lime_imputer.transform(df)
+#         df = pd.DataFrame(imputed_array, columns=df_columns)
+#
+#     # Recalculate engineered features (Ratios/Counts)
+#     df['CRP_ESR_ratio'] = df['CRP'] / df['ESR']
+#     df['RF_antiCCP_ratio'] = df['RF'] / df['antiCCP']
+#     df['C3_C4_ratio'] = df['C3'] / df['C4']
+#     df['ena_count'] = df['antiRo'] + df['antiLa'] + df['antiSm']
+#     df['systemic_autoantibody_count'] = df['ANA'] + df['antiDsDNA'] + df['antiSm']
+#     df['rf_antibody_score'] = df['RF'] * (df['antiCCP'] + 1)
+#     df['spondyloarthropathy_risk'] = df['HLA_B27'] * df['age']
+#
+#     # Use clinical thresholds for status
+#     df['inflammation_status'] = np.where(
+#         (df['ESR'] > 20.0) | (df['CRP'] > 5.0), 1, 0
+#     )
+#
+#     for column in ['gender', 'HLA_B27', 'ANA', 'antiRo', 'antiLa', 'antiDsDNA', 'antiSm', 'inflammation_status']:
+#         df[column] = df[column].astype(int)
+#
+#     # Reorder columns to match FINAL_FEATURE_NAMES exactly
+#     df_lime = df[FINAL_FEATURE_NAMES].copy()
+#
+#     # Clean up any infinity values from division
+#     df_lime = df_lime.mask(np.isinf(df_lime), 0)
+#
+#     return df_lime.values  # Returns the 22-feature unscaled array
 
 # Retrieving the autoimmune rheumatic disease class prediction
 def get_prediction(transformed_data):
@@ -331,7 +357,7 @@ def get_prediction(transformed_data):
     """
     # CatBoost model's predict_proba() function returns a 2D array for 2D inputs
     # Even for one row (individual prediction), it will return shape of (1, n_classes)
-    probabilities = model.predict_proba(transformed_data.reshape(1, -1))[0]
+    probabilities = model.predict_proba(transformed_data)[0]
     top_class_idx = np.argmax(probabilities)
 
     return probabilities, top_class_idx
@@ -663,7 +689,7 @@ def display_local_shap_interpretability(transformed_data, top_class_idx):
         force_plot = shap.force_plot(
             base_value,
             current_patient_shap_1d,
-            transformed_data.flatten(),
+            transformed_data.values.flatten(),
             feature_names=FINAL_FEATURE_NAMES,
             matplotlib=False  # Set to False for the interactive JS version for Streamlit
         )
@@ -683,7 +709,7 @@ def display_local_shap_interpretability(transformed_data, top_class_idx):
             shap.force_plot(
                 base_value,
                 current_patient_shap_1d,
-                transformed_data.flatten(),
+                transformed_data(),
                 feature_names=FINAL_FEATURE_NAMES,
                 show=False,
                 matplotlib=True  # Set to True for the LLM explainer version
@@ -704,7 +730,7 @@ def display_local_shap_interpretability(transformed_data, top_class_idx):
         explanation = shap.Explanation(
             values=current_patient_shap_1d,
             base_values=base_value,
-            data=transformed_data.flatten(),
+            data=transformed_data.values.flatten(),
             feature_names=FINAL_FEATURE_NAMES
         )
 
@@ -733,13 +759,15 @@ def lime_predict_proba(unscaled_numpy_array):
     probabilities = []
 
     for row in unscaled_numpy_array:
-        scaled_row = transform_lime_data(row)
-        probs = model.predict_proba(scaled_row.reshape(1, -1))
+        row_dict = dict(zip(FINAL_FEATURE_NAMES[:14], row))
+
+        retransformed_data_df, _ = transform_data(row_dict)
+        probs = model.predict_proba(retransformed_data_df)
         probabilities.append(probs[0])
 
     return np.array(probabilities)
 
-def display_local_lime_interpretability(lime_data, top_class_idx):
+def display_local_lime_interpretability(transformed_data, top_class_idx):
     st.divider()
     st.subheader("Local Interpretable Model-agnostic Explanations (LIME)")
 
@@ -777,11 +805,11 @@ def display_local_lime_interpretability(lime_data, top_class_idx):
 
     if cache_key not in st.session_state:
         with st.spinner(f"Generating LIME graph for the {selected_lime_disease} condition, please wait..."):
-            # Initialise LIME explainer (Uses Unscaled Training Data)
+            # Initialise LIME explainer
             lime_explanation = lime_explainer.explain_instance(
-                data_row=lime_data.flatten(),
+                data_row=transformed_data.values.flatten(),
                 predict_fn=lime_predict_proba,
-                num_features=22,
+                num_features=14,
                 labels=[lime_analysis_idx],
                 num_samples=2000
             )
@@ -1191,7 +1219,7 @@ if submit:
             #  'CRP',
             #  'RF',
             #  'antiCCP',
-            #  'HLA_B27',
+            #  'HLA-B27',
             #  'ANA',
             #  'antiRo',
             #  'antiLa',
@@ -1202,25 +1230,25 @@ if submit:
 
             raw_input_data = {
                 'age': age,
-                'gender': gender,
                 'ESR': esr,
                 'CRP': crp,
                 'RF': rf,
                 'antiCCP': anti_ccp,
-                'HLA_B27': hla_b27,
+                'C3': c3,
+                'C4': c4,
+                'gender': gender,
+                'HLA-B27': hla_b27,
                 'ANA': ana,
                 'antiRo': anti_ro,
                 'antiLa': anti_la,
                 'antiDsDNA': anti_dsdna,
-                'antiSm': anti_sm,
-                'C3': c3,
-                'C4': c4
+                'antiSm': anti_sm
             }
 
             # 2) Transform the raw input data
             transformed_data, _ = transform_data(raw_input_data)
 
-            lime_data = transform_lime_data(raw_input_data)
+            # lime_data = transform_lime_data(raw_input_data)
 
             # 3) Calculate the autoimmune rheumatic disease class with the highest probability
             probabilities, top_class_idx = get_prediction(transformed_data)
@@ -1234,7 +1262,7 @@ if submit:
                 'probabilities': probabilities,
                 'top_class_idx': top_class_idx,
                 'transformed_data': transformed_data,
-                'lime_data': lime_data
+                # 'lime_data': lime_data
             }
 
         except Exception as e:
@@ -1259,13 +1287,13 @@ if submit:
 
     display_local_shap_interpretability(transformed_data, top_class_idx)
 
-    display_local_lime_interpretability(lime_data, top_class_idx)
+    display_local_lime_interpretability(transformed_data, top_class_idx)
 
     st.session_state['last_prediction'] = {
         'predicted_disease': AUTOIMMUNE_RHEUMATIC_DISEASE_CLASSES[top_class_idx],
         'probabilities': probabilities,
-        'scaled_data': transformed_data,
-        'lime_data': lime_data,
+        'transformed_data': transformed_data,
+        # 'lime_data': lime_data,
         'current_patient_shap_1d': current_patient_shap_1d
     }
 
@@ -1301,7 +1329,7 @@ elif st.session_state.clicked:
 
     # Redisplay local LIME insights
     display_local_lime_interpretability(
-        result['lime_data'],
+        result['transformed_data'],
         result['top_class_idx']
     )
 

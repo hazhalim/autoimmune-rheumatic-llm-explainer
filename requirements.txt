@@ -14,3 +14,4 @@ pillow
 catboost
 lime
 dill
+lightgbm
